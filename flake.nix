@@ -21,7 +21,7 @@
           config.allowUnfree = true;
         };
       in rec {
-        devShell = pkgs.mkShell.override { stdenv = pkgs.stdenv; } rec {
+        devShell = pkgs.mkShell rec {
           name = "photonlibos";
 
           packages = with pkgs; [
