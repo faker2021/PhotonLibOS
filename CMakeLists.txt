@@ -88,15 +88,6 @@ add_library(
 target_compile_options(uring PRIVATE -Wno-implicit-function-declaration)
 target_include_directories(uring PRIVATE ${liburing_include_dir})
 
-# Fetch boost
-FetchContent_Declare(
-        boost
-        URL https://boostorg.jfrog.io/artifactory/main/release/1.75.0/source/boost_1_75_0.tar.gz
-        URL_MD5 38813f6feb40387dfe90160debd71251
-)
-FetchContent_MakeAvailable(boost)
-set(boost_include_dir ${boost_SOURCE_DIR})
-
 # Compile photon objects
 file(GLOB PHOTON_SRC
         photon.cpp
@@ -135,7 +126,7 @@ if (ENABLE_SASL)
 endif ()
 
 add_library(photon_obj OBJECT ${PHOTON_SRC})
-target_include_directories(photon_obj PUBLIC include ${liburing_include_dir} ${boost_include_dir})
+target_include_directories(photon_obj PUBLIC include ${liburing_include_dir})
 target_compile_definitions(photon_obj PRIVATE _FILE_OFFSET_BITS=64 FUSE_USE_VERSION=29)
 
 # Make virtual interface for external dynamic libs

@@ -45,6 +45,7 @@
             curl
             libaio
             ninja
+            boost175
           ];
 
           shellHook = let icon = "f121";
