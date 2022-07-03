@@ -20,7 +20,8 @@
           overlays = [ inputs.vitalpkgs.overlay (final: prev: { }) ];
           config.allowUnfree = true;
         };
-      in rec {
+      in
+      rec {
         devShell = pkgs.mkShell rec {
           name = "photonlibos";
 
@@ -48,11 +49,13 @@
             boost175
           ];
 
-          shellHook = let icon = "f121";
-          in ''
-            export PS1="$(echo -e '\u${icon}') {\[$(tput sgr0)\]\[\033[38;5;228m\]\w\[$(tput sgr0)\]\[\033[38;5;15m\]} (${name}) \\$ \[$(tput sgr0)\]"
-            alias cmake_debug='cmake -DCMAKE_BUILD_TYPE=Debug ..'
-          '';
+          shellHook =
+            let icon = "f121";
+            in
+            ''
+              export PS1="$(echo -e '\u${icon}') {\[$(tput sgr0)\]\[\033[38;5;228m\]\w\[$(tput sgr0)\]\[\033[38;5;15m\]} (${name}) \\$ \[$(tput sgr0)\]"
+              alias cmake_debug='cmake -DCMAKE_BUILD_TYPE=Debug ..'
+            '';
         };
 
       });
