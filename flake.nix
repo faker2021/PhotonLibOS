@@ -35,6 +35,9 @@
 
             # Development time dependencies
             gtest
+            fuse
+            gsasl
+            gflags
 
             # Build time and Run time dependencies
             openssl
