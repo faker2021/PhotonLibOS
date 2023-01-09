@@ -20,18 +20,25 @@ limitations under the License.
 #include <cerrno>
 #include <atomic>
 #include <type_traits>
-
 #include <photon/common/callback.h>
+#ifndef __aarch64__
+#include <emmintrin.h>
+#endif
 
 namespace photon
 {
-    int thread_init();
-    int thread_fini();
+    int vcpu_init();
+    int vcpu_fini();
     int wait_all();
+    int timestamp_updater_init();
+    int timestamp_updater_fini();
+    void* stackful_malloc(size_t size);
+    void stackful_free(void* ptr);
+
 
     struct thread;
-    extern "C" __thread thread* CURRENT;
-    extern uint64_t now;
+    extern __thread thread* CURRENT;
+    extern volatile uint64_t now;
 
     enum states
     {
@@ -95,42 +102,31 @@ namespace photon
     // if true, the thread `th` should cancel what is doing, and quit
     // current job ASAP (not allowed `th` to sleep or block more than
     // 10ms, otherwise -1 will be returned to `th` and errno == EPERM;
-    // if it is currently sleeping or blocking, it is thread_interupt()ed
+    // if it is currently sleeping or blocking, it is thread_interrupt()ed
     // with EPERM)
     int thread_shutdown(thread* th, bool flag = true);
 
     class MasterEventEngine;
     struct vcpu_base {
         MasterEventEngine* master_event_engine;
-        std::atomic<uint32_t> nthreads;
-        uint32_t id;
-        volatile uint64_t switch_count;
+        volatile uint64_t switch_count = 0;
     };
 
     // A helper struct in order to make some function calls inline.
     // The memory layout of its first 4 fields is the same as the one of thread.
-    struct partial_thread
-    {
+    struct partial_thread {
         uint64_t _, __;
-        vcpu_base* vcpu;
-        void* _thread_local;
-        // ...
+        volatile vcpu_base* vcpu;
+        uint64_t ___[5];
+        void* tls;
     };
 
-    // the getter and setter of thread-local variable
-    // getting and setting local in a timer context will cause undefined behavior!
-    inline void* thread_get_local()
-    {
-        return ((partial_thread*)CURRENT) -> _thread_local;
+    inline vcpu_base* get_vcpu(thread* th = CURRENT) {
+        auto vcpu = ((partial_thread*)th) -> vcpu;
+        return (vcpu_base*)vcpu;
     }
-    inline void thread_set_local(void* local)
-    {
-        ((partial_thread*)CURRENT) -> _thread_local = local;
-    }
-    inline vcpu_base* get_vcpu(thread* th = CURRENT)
-    {
-        return ((partial_thread*)th) -> vcpu;
-    }
+
+    uint32_t get_vcpu_num();
 
     /**
      * @brief Clear unused stack.
@@ -147,19 +143,44 @@ namespace photon
      * @brief Migrate a READY state thread to another vcpu
      *
      * @param th photon thead
-     * @param vcpu target vcpu ptr, if `vcpu` is nullptr, th will be migrated to
-     * unspecified vcpu
+     * @param vcpu target vcpu
      * @return int 0 for success and -1 for failure
      */
     int thread_migrate(thread* th, vcpu_base* vcpu);
 
+    inline void spin_wait() {
+#ifdef __aarch64__
+        asm volatile("isb" : : : "memory");
+#else
+        _mm_pause();
+#endif
+    }
+
     class spinlock {
     public:
-        int lock();
-        int try_lock();
-        void unlock();
+        int lock() {
+            while (unlikely(xchg())) {
+                while (likely(load())) {
+                    spin_wait();
+                }
+            }
+            return 0;
+        }
+        int try_lock() {
+            return (likely(!load()) &&
+                    likely(!xchg())) ? 0 : -1;
+        }
+        void unlock() {
+            _lock.store(false, std::memory_order_release);
+        }
     protected:
         std::atomic_bool _lock = {false};
+        bool xchg() {
+            return _lock.exchange(true, std::memory_order_acquire);
+        }
+        bool load() {
+            return _lock.load(std::memory_order_relaxed);
+        }
     };
 
     class ticket_spinlock {
@@ -290,7 +311,7 @@ namespace photon
 
     #define _TOKEN_CONCAT(a, b) a ## b
     #define _TOKEN_CONCAT_(a, b) _TOKEN_CONCAT(a, b)
-    #define SCOPED_LOCK(x, ...) locker<decltype(x)> \
+    #define SCOPED_LOCK(x, ...) photon::locker<decltype(x)> \
         _TOKEN_CONCAT_(__locker__, __LINE__) (x, ##__VA_ARGS__)
 
     class condition_variable : protected waitq
@@ -437,7 +458,7 @@ namespace photon
 */
 #define WITH_LOCK(mutex) if (auto __lock__ = scoped_lock(mutex))
 
-#define SCOPE_MAKESURE_YIELD                                       \
+#define SCOPE_MAKESURE_YIELD                                               \
     uint64_t __swc_##__LINE__ = get_vcpu(photon::CURRENT)->switch_count;   \
     DEFER(if (__swc_##__LINE__ == get_vcpu(photon::CURRENT)->switch_count) \
               photon::thread_yield(););

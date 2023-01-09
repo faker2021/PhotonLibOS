@@ -84,15 +84,18 @@ namespace rpc
                 return -1;
             }
 
-            if (ret < size)
-            {
+            if (ret < size) {
                 DeserializerIOV des;
                 respmsg.iov.truncate(ret);
                 using P = typename Operation::Response;
                 auto re = des.deserialize<P>(&respmsg.iov);
+                if (re == nullptr) return -1;
                 assert((((char*)re + sizeof(P)) <= (char*)&resp) ||
                     ((char*)re >= ((char*)&resp + sizeof(P))));
                 memcpy(&resp, re, sizeof(P));
+            } else {
+                if (!resp.validate_checksum(&respmsg.iov, nullptr, 0))
+                    return -1;
             }
             return ret;
         }
@@ -170,8 +173,11 @@ namespace rpc
             Response response;
             // some service (like preadv) may need an iovector
             // invoke actual service function in ServerClass by overloading
-            static_cast<ServerClass*>(obj) -> do_rpc_service(request, &response, &iov, stream);
-
+            auto fini = static_cast<ServerClass*>(obj) ->
+                do_rpc_service(request, &response, &iov, stream);
+            (void)fini; // To prevent possible compiler warning about unused variable.
+                        // Note that `fini` (of any type) may get destructed after sending,
+                        // giving a chance for the `Operation` to do some cleaning up.
             SerializerIOV respmsg;
             respmsg.serialize(response);
             return rs(&respmsg.iov);

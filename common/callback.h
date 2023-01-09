@@ -17,6 +17,7 @@ limitations under the License.
 #pragma once
 #include <cinttypes>
 #include <cerrno>
+#include <assert.h>
 #include <type_traits>
 
 #include <photon/common/utility.h>
@@ -33,7 +34,8 @@ struct Delegate_Base { };
 template<typename R, typename...Ts>
 struct Delegate : public Delegate_Base
 {
-    typedef R (*Func)(void*, Ts...);
+    using Func = R (*)(void*, Ts...);
+    using Func0= R (*)(Ts...);
     void* _obj = nullptr;
     Func _func = nullptr;
 
@@ -49,8 +51,8 @@ struct Delegate : public Delegate_Base
     using UFunc  = R (*)(U*, Ts...);
 
     Delegate(void* obj, Func func)      { bind(obj, func); }
-
     Delegate(Func func, void* obj)      { bind(obj, func); }
+    Delegate(Func0 func0)               { bind(func0); }
 
     template<typename U>
     Delegate(U* obj, UFunc<U> func)     { bind(obj, func); }
@@ -77,8 +79,8 @@ struct Delegate : public Delegate_Base
     }
 
     void bind(void* obj, Func func)     { _obj = obj; _func = func; }
-
     void bind(Func func, void* obj)     { _obj = obj; _func = func; }
+    void bind(Func0 func0)          { _obj = nullptr; _func = (Func&)func0; }
 
     template<typename U>
     void bind(U* obj, UFunc<U> func)    { bind(obj, (Func&)func); }
@@ -118,11 +120,9 @@ struct Delegate : public Delegate_Base
         return _func ? _func(_obj, args...) : R();
     }
 
-    R fire_once(const Ts&...args)
-    {
-        auto ret = fire(args...);
-        clear();
-        return ret;
+    R fire_once(const Ts&... args) {
+        DEFER(clear());
+        return fire(args...);
     }
 
     bool operator==(const Delegate& rhs) const {
@@ -137,6 +137,42 @@ struct Delegate : public Delegate_Base
 template<typename...Ts>
 using Callback = Delegate<int, Ts...>;
 
+// a Closure encapslates a Delegate together
+// with a ptr to a functor (or lambda object),
+// and delete it if DELETE_CLOSURE is returned.
+
+const int64_t DELETE_CLOSURE = -1234567890;
+
+template<typename...ARGS> // closure must return an int64
+struct Closure : public Delegate<int64_t, ARGS...> {
+    template<typename T>
+    explicit Closure(T* pfunctor) {
+        bind(pfunctor);
+    }
+
+    Closure() = default;
+
+    using base = Delegate<int64_t, ARGS...>;
+    using base::base;
+
+    template<typename T>
+    void bind(T* pfunctor) {
+        this->_obj = pfunctor;
+        this->_func = [](void* task, ARGS...args) {
+            assert(task);
+            auto t = (T*)task;
+            int64_t ret = (*t)(args...);
+            if (ret == DELETE_CLOSURE) delete t;
+            return ret;
+        };
+    }
+
+    using base::bind;
+};
+
+using Closure0 = struct Closure<>;
+
+/*
 inline int __Examples_of_Callback(void*, int, double, long)
 {
     static char ptr[] = "example";
@@ -165,5 +201,6 @@ inline int __Examples_of_Callback(void*, int, double, long)
 
     return 0;
 }
+*/
 
 #pragma GCC diagnostic pop

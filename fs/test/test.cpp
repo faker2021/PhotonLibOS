@@ -32,7 +32,9 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
+#ifdef __linux__
 #include <malloc.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #include <ctime>
@@ -93,18 +95,18 @@ TEST(Path, split)
         Path path(p);
         vector<string> sp;
         for (auto x: path)
-            sp.push_back(x.to_string());
+            sp.push_back(std::string(x));
         EXPECT_EQ(sp, *it);
         ++it;
 
         sp.clear();
         for (auto x: path.directory())
-            sp.push_back(x.to_string());
+            sp.push_back(std::string(x));
         EXPECT_EQ(sp, *itd);
         ++itd;
 
         for (auto it = path.begin(); it!=path.end(); ++it)
-            cout << it->to_string() << ", ";
+            cout << *it << ", ";
         cout << endl;
     }
 }
@@ -498,6 +500,22 @@ namespace fs
         {
             callback_umimplemented(done);
         }
+        OVERRIDE_ASYNC(int, utime, const char *path, const struct utimbuf *file_times)
+        {
+            callback_umimplemented(done);
+        }
+        OVERRIDE_ASYNC(int, utimes, const char *path, const struct timeval times[2])
+        {
+            callback_umimplemented(done);
+        }
+        OVERRIDE_ASYNC(int, lutimes, const char *path, const struct timeval times[2])
+        {
+            callback_umimplemented(done);
+        }
+        OVERRIDE_ASYNC(int, mknod, const char *path, mode_t mode, dev_t dev)
+        {
+            callback_umimplemented(done);
+        }
         OVERRIDE_ASYNC0(int, syncfs)
         {
             callback_umimplemented(done);
@@ -683,6 +701,9 @@ TEST(AsyncFS, Timeout)
     // fd_events_fini();
 }
 
+#if defined(__linux__)
+// Mock a failed memory allocation test case
+#if !__GLIBC_PREREQ(2, 34)
 void (*old_free)(void *ptr, const void *caller);
 void *(*old_malloc)(size_t size, const void *caller);
 
@@ -712,6 +733,8 @@ void my_free(void *ptr, const void *caller) {
     malloc_unhook();
     free(ptr);
 }
+#endif
+#endif // defined(__linux__)
 
 TEST(range_split, sub_range)
 {
@@ -878,7 +901,7 @@ TEST(range_split_vi, basic) {
     EXPECT_FALSE(split.ascending(kpfail, 7));
     EXPECT_DEATH(
         not_ascend_death(),
-        ".*fs::range_split_vi::range_split_vi.*"
+        ".*range-split-vi.h.*"
     );
 }
 
@@ -1091,7 +1114,7 @@ TEST(XFile, error_stiuation) {
     zero_stat.st_size=0;
     frage_stat.st_size=4095;
     different_size_stat.st_size=5120;
-    Mock::MockNullFile nop;
+    PMock::MockNullFile nop;
     //fstat在LinearFile和StripeFile创建时会访问，因此需要先模拟为正常以成功打开文件，再模拟失败
     EXPECT_CALL(nop, fstat(_)).Times(AtLeast(1))
         .WillOnce(Return(-1))
@@ -1158,11 +1181,15 @@ TEST(XFile, error_stiuation) {
     xf = new_stripe_file(1025, lf, 2, false);
     EXPECT_EQ(nullptr, xf);
 
+#if defined(__linux__)
+#if !__GLIBC_PREREQ(2, 34)
     init_hook();
     malloc_hook();
     IFile* rtp = new_linear_file(lf, 2, false);
     malloc_unhook();
     EXPECT_EQ(nullptr, rtp);
+#endif
+#endif // defined(__linux__)
 }
 
 void fill_random_buff(char * buff, size_t length) {
@@ -1247,7 +1274,7 @@ TEST(AlignedFileAdaptor, err_situation) {
     IFile *wrong_size_aligned_file = new_aligned_file_adaptor(underlay_file, getpagesize() - 1, true, false);
     EXPECT_EQ(nullptr, wrong_size_aligned_file);
     EXPECT_EQ(EINVAL, errno);
-    Mock::MockNullFile mock_file;
+    PMock::MockNullFile mock_file;
     EXPECT_CALL(mock_file, pread(_, _, _))
         .Times(AtLeast(1))
         .WillOnce(Return(-1))
@@ -1266,8 +1293,8 @@ TEST(AlignedFileAdaptor, err_situation) {
 }
 
 TEST(range_split_vi, special_case) {
-    auto offset = 10601376;
-    auto len = 2256;
+    uint64_t offset = 10601376;
+    uint64_t len = 2256;
     vector<uint64_t> kp{0, offset, offset+len, UINT64_MAX};
     range_split split(10601376, 2256, 4096);
     ASSERT_TRUE(split.small_note);
@@ -1341,11 +1368,11 @@ TEST(Walker, basic) {
 int main(int argc, char **argv)
 {
     ::testing::InitGoogleTest(&argc, argv);
-    photon::thread_init();
+    photon::vcpu_init();
     photon::fd_events_init();
     DEFER({
         photon::fd_events_fini();
-        photon::thread_fini();
+        photon::vcpu_fini();
     });
     int ret = RUN_ALL_TESTS();
     LOG_ERROR_RETURN(0, ret, VALUE(ret));

@@ -156,6 +156,11 @@ namespace fs
         DEFINE_ASYNC(ssize_t, flistxattr, char *list, size_t size);
         DEFINE_ASYNC(int, fsetxattr, const char *name, const void *value, size_t size, int flags);
         DEFINE_ASYNC(int, fremovexattr, const char *name);
+
+        const static uint32_t OPID_FGETXATTR   = 30;
+        const static uint32_t OPID_FLISTXATTR  = 31;
+        const static uint32_t OPID_FSETXATTR   = 32;
+        const static uint32_t OPID_FREMOVEXATTR  = 33;
     };
 
     class AsyncDIR : public Object
@@ -199,6 +204,10 @@ namespace fs
         DEFINE_ASYNC(int, lstat, const char *path, struct stat *buf);
         DEFINE_ASYNC(int, access, const char *pathname, int mode);
         DEFINE_ASYNC(int, truncate, const char *path, off_t length);
+        DEFINE_ASYNC(int, utime, const char *path, const struct utimbuf *file_times);
+        DEFINE_ASYNC(int, utimes, const char *path, const struct timeval times[2]);
+        DEFINE_ASYNC(int, lutimes, const char *path, const struct timeval times[2]);
+        DEFINE_ASYNC(int, mknod, const char *path, mode_t mode, dev_t dev);
         DEFINE_ASYNC0(int, syncfs);
 
         DEFINE_ASYNC(AsyncDIR*, opendir, const char *name);
@@ -223,6 +232,10 @@ namespace fs
         const static uint32_t OPID_TRUNCATE = 81;
         const static uint32_t OPID_SYNCFS   = 82;
         const static uint32_t OPID_OPENDIR  = 83;
+        const static uint32_t OPID_UTIME    = 84;
+        const static uint32_t OPID_UTIMES   = 85;
+        const static uint32_t OPID_LUTIMES  = 86;
+        const static uint32_t OPID_MKNOD    = 87;
     };
 
     class IAsyncFileSystemXAttr
@@ -238,6 +251,15 @@ namespace fs
         DEFINE_ASYNC(int, lsetxattr, const char *path, const char *name, const void *value, size_t size, int flags);
         DEFINE_ASYNC(int, removexattr, const char *path, const char *name);
         DEFINE_ASYNC(int, lremovexattr, const char *path, const char *name);
+
+        const static uint32_t OPID_GETXATTR   = 90;
+        const static uint32_t OPID_LGETXATTR   = 91;
+        const static uint32_t OPID_LISTXATTR  = 92;
+        const static uint32_t OPID_LLISTXATTR  = 93;
+        const static uint32_t OPID_SETXATTR   = 94;
+        const static uint32_t OPID_LSETXATTR   = 95;
+        const static uint32_t OPID_REMOVEXATTR  = 96;
+        const static uint32_t OPID_LREMOVEXATTR  = 97;
     };
 
     class IFile;

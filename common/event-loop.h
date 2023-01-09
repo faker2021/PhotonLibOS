@@ -19,7 +19,7 @@ limitations under the License.
 #include <photon/common/object.h>
 
 namespace photon {
-class thread;
+struct thread;
 };
 
 class EventLoop : public Object {
@@ -31,7 +31,7 @@ public:
 
     // return value > 0 indicates there is (are) event(s)
     // return value = 0 indicates there is still no event
-    // return value < 0 indicates interrupted
+    // return value < 0 indicates interrupted, will then exit the loop
     using Wait4Events = Callback<EventLoop*>;
 
     // return value is ignored

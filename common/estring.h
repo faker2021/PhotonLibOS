@@ -82,7 +82,10 @@ public:
     {
         return std::string(data(), length());
     }
-
+    bool all_digits() const
+    {
+        return to_uint64_check(nullptr);
+    }
     estring_view substr(size_type pos = 0, size_type count = npos) const
     {
         auto ret = std::string_view::substr(pos, count);
@@ -106,9 +109,7 @@ public:
         return length() >= len &&
             memcmp(data(), x.data(), len) == 0;
     }
-    bool istarts_with(estring_view x) {
-        return strncasecmp(data(), x.data(), x.size()) == 0;
-    }
+
     bool ends_with(estring_view x)
     {
         auto len = x.size();
@@ -116,6 +117,17 @@ public:
             memcmp(&*end() - len, x.data(), len) == 0;
     }
 #endif
+
+    bool istarts_with(estring_view x) {
+        return strncasecmp(data(), x.data(), x.size()) == 0;
+    }
+
+    int icmp(estring_view x) {
+        auto ret = strncasecmp(data(), x.data(), std::min(size(), x.size()));
+        if (ret != 0) return ret;
+        return size() - x.size();
+    }
+
     template<typename Separator>
     struct _split
     {
@@ -273,7 +285,13 @@ public:
     {
         return split(charset("\r\n"), consecutive_merge);
     }
-    uint64_t to_uint64() const;
+    bool     to_uint64_check(uint64_t* v = nullptr) const;
+    uint64_t to_uint64(uint64_t default_val = 0) const
+    {
+        uint64_t val;
+        to_uint64_check(&val);
+        return val;
+    }
     // do not support 0x/0X prefix
     uint64_t hex_to_uint64() const;
 };
@@ -400,6 +418,10 @@ public:
         return view().ends_with(x);
     }
 #endif
+    bool all_digits() const
+    {
+        return view().all_digits();
+    }
 
     template<typename...Ts>
     auto split(const Ts&...xs) const ->

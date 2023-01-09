@@ -34,10 +34,25 @@ __attribute__((constructor)) static void crc_init() {
 }
 
 #if (defined(__aarch64__) && defined(__ARM_FEATURE_CRC32))
-#define __builtin_ia32_crc32di __builtin_aarch64_crc32cx
-#define __builtin_ia32_crc32si __builtin_aarch64_crc32cw
-#define __builtin_ia32_crc32hi __builtin_aarch64_crc32ch
-#define __builtin_ia32_crc32qi __builtin_aarch64_crc32cb
+#if (defined(__clang__))
+#define _crc32di __builtin_arm_crc32cd
+#define _crc32qi __builtin_arm_crc32cb
+#else
+#define _crc32di __builtin_aarch64_crc32cx
+#define _crc32qi __builtin_aarch64_crc32cb
+#endif
+#elif (defined(__aarch64__))
+static inline uint32_t _crc32di(uint32_t crc, uint64_t value) {
+  __asm__("crc32cx %w[c], %w[c], %x[v]":[c]"+r"(crc):[v]"r"(value));
+  return crc;
+}
+static inline uint32_t _crc32qi(uint32_t crc, uint8_t value) {
+  __asm__("crc32cb %w[c], %w[c], %w[v]":[c]"+r"(crc):[v]"r"(value));
+  return crc;
+}
+#else
+#define _crc32di __builtin_ia32_crc32di
+#define _crc32qi __builtin_ia32_crc32qi
 #endif
 
 uint32_t crc32c_hw(const uint8_t *data, size_t nbytes, uint32_t crc) {
@@ -51,7 +66,7 @@ uint32_t crc32c_hw(const uint8_t *data, size_t nbytes, uint32_t crc) {
   if (mask != 0) {
     size_t limit = std::min(nbytes, sizeof(uint64_t) - mask);
     while (offset < limit) {
-      sum = (uint32_t)__builtin_ia32_crc32qi(sum, data[offset]);
+      sum = (uint32_t)_crc32qi(sum, data[offset]);
       offset++;
     }
   }
@@ -59,13 +74,13 @@ uint32_t crc32c_hw(const uint8_t *data, size_t nbytes, uint32_t crc) {
   // Process 8 bytes at a time until we have fewer than 8 bytes left.
   while (offset + sizeof(uint64_t) <= nbytes) {
     const uint64_t *src = (const uint64_t *)(data + offset);
-    sum = __builtin_ia32_crc32di(sum, *src);
+    sum = _crc32di(sum, *src);
     offset += sizeof(uint64_t);
   }
 
   // Process any bytes remaining after the last aligned 8-byte block.
   while (offset < nbytes) {
-    sum = (uint32_t)__builtin_ia32_crc32qi(sum, data[offset]);
+    sum = (uint32_t)_crc32qi(sum, data[offset]);
     offset++;
   }
   return sum;
@@ -744,4 +759,8 @@ uint32_t crc32c_extend(const void *data, size_t nbytes, uint32_t crc) {
 
 uint32_t crc32c(const void *data, size_t nbytes) {
   return crc32c_extend(reinterpret_cast<const uint8_t*>(data), nbytes, 0);
+}
+
+bool is_crc32c_hw_available() {
+    return crc32c_func == crc32c_hw;
 }

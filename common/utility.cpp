@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#include <sys/utsname.h>
 #include <execinfo.h>
 #include "utility.h"
 #include "estring.h"
@@ -21,24 +22,14 @@ limitations under the License.
 
 using namespace std;
 
-namespace Utility {
-
-inline bool all_digits(string_view s)
-{
-    for (auto c: s)
-        if (!isdigit(c))
-            return false;
-    return true;
-}
-
-int version_compare(const std::string& a, const std::string& b, int& result) {
-    auto sa = ((estring&) a).split('.');
-    auto sb = ((estring&) b).split('.');
+int version_compare(string_view a, string_view b, int& result) {
+    auto sa = ((estring_view&)a).split('.');
+    auto sb = ((estring_view&)b).split('.');
 
     for (auto ita = sa.begin(), itb = sb.begin();
             ita != sa.end() && itb != sb.end();
             ++ita, ++itb) {
-        if (!all_digits(*ita) || !all_digits(*itb)) {
+        if (!ita->all_digits() || !itb->all_digits()) {
             return -1;
         }
         if (ita->size() == itb->size()) {
@@ -55,6 +46,18 @@ int version_compare(const std::string& a, const std::string& b, int& result) {
     return 0;
 }
 
+int kernel_version_compare(std::string_view dst, int& result) {
+    utsname buf = {};
+    uname(&buf);
+    estring kernel_release(buf.release);
+    estring_view kernel_version = kernel_release.split("-")[0];
+    int ret = version_compare(kernel_version, dst, result);
+    if (ret != 0) {
+        LOG_ERRNO_RETURN(0, -1, "Unable to detect kernel version, `", kernel_release.c_str());
+    }
+    return 0;
+}
+
 void print_stacktrace() {
     int size = 16;
     void * array[16];
@@ -67,4 +70,3 @@ void print_stacktrace() {
     free(stacktrace);
 }
 
-}

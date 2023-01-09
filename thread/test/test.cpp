@@ -207,7 +207,7 @@ thread_local photon::mutex aMutex;
 void* thread_test_function(void* arg)
 {
     LOG_DEBUG(VALUE(CURRENT), " before lock");
-    scoped_lock aLock(aMutex);
+    photon::scoped_lock aLock(aMutex);
     LOG_DEBUG(VALUE(CURRENT), " after lock");
 
     uint32_t* result = (uint32_t*)arg;
@@ -248,7 +248,7 @@ void* thread_test_function(void* arg)
 void wait_for_completion(int vcpu_id = -1)
 {
     auto current = CURRENT;
-    auto& sleepq = current->vcpu->sleepq;
+    auto& sleepq = current->get_vcpu()->sleepq;
     while (true)
     {
         photon::thread_usleep(1);
@@ -331,7 +331,7 @@ TEST(ListTest, HandleNoneZeroInput)
     EXPECT_EQ(10, deleteCount);
 }
 
-thread_local static int running = 0;
+thread_local static int volatile running = 0;
 void* thread_pong(void* depth)
 {
 #ifdef RANDOMIZE_SP
@@ -340,7 +340,7 @@ void* thread_pong(void* depth)
 #endif
     running = 1;
     while (running)
-        thread_yield_to(nullptr);
+        thread_yield_fast();
     return nullptr;
 }
 
@@ -354,11 +354,11 @@ void test_thread_switch(uint64_t nth, uint64_t stack_size)
         photon::thread_create(&thread_pong, (void*)(uint64_t)(rand() % 32), stack_size);
 
     for (uint64_t i = 0; i < count; ++i)
-        thread_yield_to(nullptr);
+        thread_yield_fast();
 
     auto t0 = now_time();
     for (uint64_t i = 0; i < count; ++i)
-        thread_yield_to(nullptr);
+        thread_yield_fast();
 
     auto t1 = now_time();
 
@@ -395,6 +395,14 @@ TEST(Perf, ThreadSwitch)
     {
         test_thread_switch(100000, (1<<ss) * 1024);
     }
+}
+
+TEST(Perf, ThreadSwitchWithStandaloneTSUpdater)
+{
+    timestamp_updater_init();
+    DEFER(timestamp_updater_fini());
+    test_thread_switch(10, 64 * 1024);
+    return;
 }
 
 thread_local int shot_count;
@@ -715,10 +723,46 @@ TEST(ThreadPool, test)
     ths.resize(FLAGS_ths_total);
     for (int i = 0; i<FLAGS_ths_total; i++)
         ths[i] = pool.thread_create_ex(&::func1, nullptr, true);
-    LOG_INFO("----------");
+    // LOG_INFO("----------");
     for (int i = 0; i<FLAGS_ths_total; i++) {
         LOG_DEBUG("wait thread: `", ths[i]->th);
         pool.join(ths[i]);
+    }
+    // LOG_INFO("???????????????");
+}
+
+TEST(ThreadPool, migrate) {
+    WorkPool wp(4, 0, 0, -1);
+    ThreadPool<64> pool(64 * 1024);
+    vector<TPControl*> ths;
+    ths.resize(FLAGS_ths_total);
+    for (int i = 0; i < FLAGS_ths_total; i++) {
+        ths[i] = pool.thread_create_ex(&::func1, nullptr, true);
+        wp.thread_migrate(ths[i]->th);
+    }
+    LOG_INFO("----------");
+    for (int i = 0; i < FLAGS_ths_total; i++) {
+        LOG_DEBUG("wait thread: `", ths[i]->th);
+        pool.join(ths[i]);
+    }
+    LOG_INFO("???????????????");
+}
+
+TEST(ThreadPool, multithread) {
+    WorkPool wp(4, 0, 0, -1);
+    ThreadPool<64> pool(64 * 1024);
+    vector<TPControl*> ths;
+    ths.resize(FLAGS_ths_total);
+    for (int i = 0; i < FLAGS_ths_total; i++) {
+        wp.call(
+            [&] { ths[i] = pool.thread_create_ex(&::func1, nullptr, true); });
+    }
+    LOG_INFO("----------");
+    for (int i = 0; i < FLAGS_ths_total; i++) {
+        wp.call([&] {
+            LOG_DEBUG("wait thread: `", ths[i]->th);
+            pool.join(ths[i]);
+        });
     }
     LOG_INFO("???????????????");
 }
@@ -789,8 +833,8 @@ TEST(RWLock, smp) {
     std::vector<std::thread> ths;
     for (int i=0 ;i< 10;i++) {
         ths.emplace_back([&]{
-            photon::thread_init();
-            DEFER(photon::thread_fini());
+            photon::vcpu_init();
+            DEFER(photon::vcpu_fini());
             for (int i = 0; i < 100; i++){
                 auto ret = lock.lock(WLOCK);
                 // LOG_INFO("Locked");
@@ -895,8 +939,8 @@ void defer_ctx(void* th)
 TEST(context_switch, defer)
 {
     auto th = thread_create(&to_ctx, nullptr);
-    auto r = prepare_usleep(CURRENT, 1000*1000, nullptr);
-    switch_context_defer(r.t0, r.next, &defer_ctx, th);
+    auto r = prepare_usleep(1000*1000, nullptr);
+    switch_context_defer(r.from, r.to, &defer_ctx, th);
 }
 
 template<typename...Ts>
@@ -922,9 +966,9 @@ void std_threads_create_join(int N, Ts&&...xs)
 
 void photon_do(int n, thread_entry start, void* args)
 {
-    photon::thread_init();
+    photon::vcpu_init();
     photon::threads_create_join(n, start, args);
-    photon::thread_fini();
+    photon::vcpu_fini();
 }
 
 struct smp_args
@@ -1038,8 +1082,8 @@ TEST(smp, rwlock) {
     srw_count = 0;
     swriting = false;
     std_threads_create_join(10, [&]{
-        photon::thread_init();
-        DEFER(photon::thread_fini());
+        photon::vcpu_init();
+        DEFER(photon::vcpu_fini());
         std::vector<photon::join_handle*> handles;
         for (uint64_t i=0; i<100;i++) {
             uint64_t arg = (i << 32) | (rand()%10 < 7 ? photon::RLOCK : photon::WLOCK);
@@ -1195,8 +1239,8 @@ TEST(mutex, timeout_is_zero) {
     std::atomic<int> cnt(0);
     for (int i=0;i<32;i++) {
         ths.emplace_back([&]{
-            photon::thread_init();
-            DEFER(photon::thread_fini());
+            photon::vcpu_init();
+            DEFER(photon::vcpu_fini());
             for(int j=0;j<10000;j++) {
                 auto ret = mtx.lock(0);
                 if (ret == 0)
@@ -1227,13 +1271,6 @@ int jobwork(WorkPool* pool, int i) {
     return 0;
 }
 
-int jobasyncwork(WorkPool* pool, int i) {
-    LOG_INFO("START");
-    this_thread::sleep_for(std::chrono::seconds(1));
-    LOG_INFO("FINISH");
-    return 0;
-}
-
 TEST(workpool, work) {
     std::unique_ptr<WorkPool> pool(new WorkPool(2));
 
@@ -1251,18 +1288,28 @@ TEST(workpool, work) {
     EXPECT_LE(duration, std::chrono::seconds(3));
 }
 
-TEST(workpool, async_work) {
-    std::unique_ptr<WorkPool> pool(new WorkPool(2));
+TEST(workpool, async_work_capture) {
+    std::unique_ptr<WorkPool> pool(new WorkPool(2, 0, 0, 0));
 
-    std::vector<photon::join_handle*> jhs;
+    photon::semaphore sem;
+    int flag[10] = {0};
     auto start = std::chrono::system_clock::now();
-    for (int i = 0; i < 4; i++) {
-        pool->async_call(jobasyncwork, pool.get(), i);
+    for (int i = 0; i < 10; i++) {
+        pool->async_call(new auto([&sem, i, &flag]{
+            EXPECT_FALSE(flag[i]);
+            flag[i] = true;
+            auto x = i;
+            LOG_INFO(x);
+            photon::thread_usleep(2000 * 1000);
+            EXPECT_EQ(x, i);
+            EXPECT_TRUE(flag[i]);
+            sem.signal(1);
+        }));
     }
     auto duration = std::chrono::system_clock::now() - start;
     EXPECT_GE(duration, std::chrono::seconds(0));
     EXPECT_LE(duration, std::chrono::seconds(1));
-    photon::thread_sleep(3);
+    sem.wait(10);
     LOG_INFO("DONE");
 }
 
@@ -1303,24 +1350,118 @@ TEST(workpool, async_work_lambda) {
     std::vector<photon::join_handle*> jhs;
     auto start = std::chrono::system_clock::now();
     for (int i = 0; i < 4; i++) {
+        CopyMoveRecord *r = new CopyMoveRecord();
         pool->async_call(
-            [](WorkPool* pool, int i, CopyMoveRecord r) {
-                LOG_INFO("START ", VALUE(__cplusplus), VALUE(r.copy),
-                         VALUE(r.move));
-#if __cplusplus < 201300L
-                EXPECT_EQ(1, r.copy);
-#else
-                EXPECT_EQ(0, r.copy);
-#endif
+            new auto ([i, r]() {
+                LOG_INFO("START ", VALUE(__cplusplus), VALUE(r->copy),
+                         VALUE(r->move));
+                EXPECT_EQ(0, r->copy);
                 this_thread::sleep_for(std::chrono::seconds(1));
                 LOG_INFO("FINISH");
-            },
-            pool.get(), i, CopyMoveRecord());
+                delete r;
+            }));
     }
     auto duration = std::chrono::system_clock::now() - start;
     EXPECT_GE(duration, std::chrono::seconds(0));
     EXPECT_LE(duration, std::chrono::seconds(1));
     photon::thread_sleep(3);
+    LOG_INFO("DONE");
+}
+
+
+TEST(workpool, async_work_lambda_threadcreate) {
+    std::unique_ptr<WorkPool> pool(new WorkPool(1, 0, 0, 0));
+
+    std::vector<photon::join_handle*> jhs;
+    auto start = std::chrono::system_clock::now();
+    photon::semaphore sem;
+    for (int i = 0; i < 4; i++) {
+        CopyMoveRecord *r = new CopyMoveRecord();
+        pool->async_call(
+            new auto ([&sem, i, r]() {
+                LOG_INFO("START ", VALUE(__cplusplus), VALUE(r->copy),
+                         VALUE(r->move));
+                EXPECT_EQ(0, r->copy);
+                photon::thread_sleep(1);
+                sem.signal(1);
+                LOG_INFO("FINISH");
+                delete r;
+            }));
+    }
+    auto duration = std::chrono::system_clock::now() - start;
+    EXPECT_GE(duration, std::chrono::seconds(0));
+    EXPECT_LE(duration, std::chrono::seconds(1));
+    sem.wait(4);
+    duration = std::chrono::system_clock::now() - start;
+    EXPECT_GE(duration, std::chrono::seconds(1));
+    EXPECT_LE(duration, std::chrono::seconds(2));
+    LOG_INFO("DONE");
+}
+
+TEST(workpool, async_work_lambda_threadpool) {
+    std::unique_ptr<WorkPool> pool(new WorkPool(1, 0, 0, 4));
+
+    std::vector<photon::join_handle*> jhs;
+    auto start = std::chrono::system_clock::now();
+    photon::semaphore sem;
+    for (int i = 0; i < 4; i++) {
+        CopyMoveRecord *r = new CopyMoveRecord();
+        pool->async_call(
+            new auto ([&sem, i, r]() {
+                LOG_INFO("START ", VALUE(__cplusplus), VALUE(r->copy),
+                         VALUE(r->move));
+                EXPECT_EQ(0, r->copy);
+                photon::thread_sleep(1);
+                sem.signal(1);
+                LOG_INFO("FINISH");
+                delete r;
+            }));
+    }
+    auto duration = std::chrono::system_clock::now() - start;
+    EXPECT_GE(duration, std::chrono::seconds(0));
+    EXPECT_LE(duration, std::chrono::seconds(1));
+    sem.wait(4);
+    duration = std::chrono::system_clock::now() - start;
+    LOG_INFO(VALUE(duration.count()));
+    EXPECT_GE(duration, std::chrono::seconds(1));
+    EXPECT_LE(duration, std::chrono::seconds(2));
+    LOG_INFO("DONE");
+}
+
+TEST(workpool, async_work_lambda_threadpool_append) {
+    std::unique_ptr<WorkPool> pool(new WorkPool(0, 0, 0, 0));
+
+    for (int i=0;i<4;i++) {
+        std::thread([&]{
+            photon::vcpu_init();
+            DEFER(photon::vcpu_fini());
+            pool->join_current_vcpu_into_workpool();
+        }).detach();
+    }
+
+    std::vector<photon::join_handle*> jhs;
+    auto start = std::chrono::system_clock::now();
+    photon::semaphore sem;
+    for (int i = 0; i < 4; i++) {
+        CopyMoveRecord *r = new CopyMoveRecord();
+        pool->async_call(
+            new auto ([&sem, i, r]() {
+                LOG_INFO("START ", VALUE(__cplusplus), VALUE(r->copy),
+                         VALUE(r->move));
+                EXPECT_EQ(0, r->copy);
+                photon::thread_sleep(1);
+                sem.signal(1);
+                LOG_INFO("FINISH");
+                delete r;
+            }));
+    }
+    auto duration = std::chrono::system_clock::now() - start;
+    EXPECT_GE(duration, std::chrono::seconds(0));
+    EXPECT_LE(duration, std::chrono::seconds(1));
+    sem.wait(4);
+    duration = std::chrono::system_clock::now() - start;
+    EXPECT_GE(duration, std::chrono::seconds(1));
+    EXPECT_LE(duration, std::chrono::seconds(2));
     LOG_INFO("DONE");
 }
 
@@ -1345,8 +1486,8 @@ TEST(photon, migrate) {
     photon::thread *th;
     photon::semaphore sem, semdone;
     std::thread worker([&vcpu, &sem, &th, &semdone]{
-        photon::thread_init();
-        DEFER(photon::thread_fini());
+        photon::vcpu_init();
+        DEFER(photon::vcpu_fini());
         th = CURRENT;
         vcpu = photon::get_vcpu();
         sem.signal(1);
@@ -1423,10 +1564,12 @@ void* testwork(void*) {
     return nullptr;
 }
 
+#if !defined(__aarch64__) && defined(__linux__)
 TEST(photon, free_stack) {
     auto th = thread_enable_join(thread_create(&testwork, nullptr));
     thread_join(th);
 }
+#endif
 
 void* __null_work(void*) {
     LOG_INFO("RUNNING");
@@ -1444,10 +1587,10 @@ TEST(smp, join_on_smp) {
     jh.clear();
     for (int i=0;i<3;i++) {
         jt.emplace_back([&]{
-            photon::thread_init();
+            photon::vcpu_init();
             DEFER({
                 LOG_INFO("before FINI");
-                photon::thread_fini();
+                photon::vcpu_fini();
                 LOG_INFO("FINI");
             });
             {
@@ -1499,23 +1642,238 @@ TEST(thread11, lambda) {
     auto lambda = [](photon::semaphore &sem){
         sem.signal(1);
     };
-    photon::thread_create11(lambda, sem);
+    photon::thread_create11(lambda, std::ref(sem));
     EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
     auto lambda2 = [&sem]{
         sem.signal(1);
     };
     photon::thread_create11(lambda2);
-    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));    
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
 }
 
+struct simple_functor {
+    void operator()(char) {}
+};
+
+struct simple_typed_functor {
+    int operator()(char) { return 0; }
+};
+
+struct overloaded_functor {
+    void operator()(char) {}
+    void operator()(int) {}
+};
+
+struct dumb_object {};
+
+struct static_member_function {
+    static void somefunc(char) {}
+};
+
+struct member_function_bind {
+    void somefunc() {}
+} mf;
+
+void func(void*, char) {}
+
+TEST(thread11, functor_trait) {
+    char x = rand();
+    auto lambda = [](){};
+    auto lambda2 = [x](char) {(void)x; };
+    auto lambda3 = [lambda, &x]()->int { lambda(); return (int)x; };
+    auto bind_obj = std::bind(&member_function_bind::somefunc, &mf);
+
+    EXPECT_EQ(true, (is_functor<simple_functor, char>::value));
+    EXPECT_EQ(true, (is_functor<simple_typed_functor, char>::value));
+    EXPECT_EQ(true, (is_functor<overloaded_functor, char>::value));
+    EXPECT_EQ(true, (is_functor<overloaded_functor, int>::value));
+    EXPECT_EQ(true, (is_functor<decltype(lambda)>::value));
+    EXPECT_EQ(true, (is_functor<typename std::add_lvalue_reference<decltype(lambda)>::type>::value));
+    EXPECT_EQ(true, (is_functor<typename std::add_rvalue_reference<decltype(lambda)>::type>::value));
+    EXPECT_EQ(true, (is_functor<decltype(lambda2), char>::value));
+    EXPECT_EQ(true, (is_functor<decltype(lambda3)>::value));
+    EXPECT_EQ(true, (is_functor<decltype(bind_obj)>::value));
+    EXPECT_EQ(false, (is_functor<dumb_object>::value));
+    EXPECT_EQ(false, (is_functor<static_member_function, char>::value));
+    EXPECT_EQ(false, (is_functor<decltype(&static_member_function::somefunc), char>::value));
+    EXPECT_EQ(false, (is_functor<size_t>::value));
+}
+
+struct invoke_functor {
+    photon::semaphore &sem;
+    void operator()(char) {
+        sem.signal(1);
+    }
+};
+
+struct invoke_typed_functor {
+    photon::semaphore &sem;
+    int operator()(char) {
+        sem.signal(1);
+        return 0;
+    }
+};
+
+struct invoke_overloaded_functor {
+    photon::semaphore &sem;
+    void operator()(char) {
+        sem.signal(1);
+    }
+    void operator()(int) {
+        sem.signal(2);
+    }
+};
+
+struct invoke_function_bind {
+    photon::semaphore &sem;
+    void somefunc() {
+        sem.signal(1);
+    }
+};
+
+TEST(thread11, functor_invoke) {
+    photon::semaphore sem;
+    char x = 1;
+    auto lambda = [&sem](){sem.signal(1);};
+    auto lambda2 = [x](photon::semaphore&sem) { sem.signal(x); };
+    auto lambda3 = [lambda2, &x, &sem]()->int { lambda2(sem); return (int)x; };
+    invoke_function_bind mf{sem};
+    auto bind_obj = std::bind(&invoke_function_bind::somefunc, &mf);
+
+    invoke_functor ivf1{sem};
+    invoke_typed_functor ivf2{sem};
+    invoke_overloaded_functor ivf3{sem};
+
+    thread_create11(ivf1, 'x');
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+    thread_create11(ivf2, 'x');
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+    thread_create11(ivf3, 'x');
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+    thread_create11(ivf3, 123);
+    EXPECT_EQ(0, sem.wait(2, 1UL*1000*1000));
+    thread_create11(lambda);
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+    thread_create11(lambda2, std::ref(sem));
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+    thread_create11(lambda3);
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+    thread_create11(bind_obj);
+    EXPECT_EQ(0, sem.wait(1, 1UL*1000*1000));
+}
+
+TEST(thread11, functor_param) {
+    photon::semaphore sem;
+    int arr[8] = {0};
+    for (int i=0;i<8;i++) {
+        thread_create11([&](int x){
+            arr[x] ++;
+            LOG_INFO(VALUE(x));
+            sem.signal(1);
+        }, i);
+    }
+    sem.wait(8);
+    for (int i=0;i<8;i++) {
+        EXPECT_EQ(1, arr[i]);
+    }
+    memset(arr, 0, sizeof(arr));
+    for (int i=0;i<8;i++) {
+        thread_create11([i, &arr, &sem](){
+            arr[i] ++;
+            LOG_INFO(VALUE(i));
+            sem.signal(1);
+        });
+    }
+    sem.wait(8);
+    for (int i=0;i<8;i++) {
+        EXPECT_EQ(1, arr[i]);
+    }
+}
+
+struct IntNode : intrusive_list_node<IntNode> {
+    int x;
+    IntNode() = default;
+};
+
+TEST(intrusive_list, split) {
+    intrusive_list<IntNode> testlist;
+    IntNode intarr[100];
+
+    for (int i=0;i<100;i++) {
+        intarr[i].x=i;
+        testlist.push_back(&intarr[i]);
+    }
+
+    // since testlist member are on stack
+    // just set to clear, without delete
+    DEFER(testlist.node = nullptr);
+
+    auto sp = testlist.split_front_exclusive(&intarr[50]);
+    DEFER(sp.node = nullptr);
+    int cnt = 0;
+    for (auto x : sp) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(50, cnt);
+    for (auto x : testlist) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(100, cnt);
+
+    auto ssp = sp.split_front_inclusive(&intarr[15]);
+    DEFER(ssp.node = nullptr);
+    cnt = 0;
+    for (auto x : ssp) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(16, cnt);
+    for (auto x : sp) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(50, cnt);
+
+    auto esplit = ssp.split_front_exclusive(&intarr[0]);
+    DEFER(esplit.node = nullptr);
+    EXPECT_EQ(nullptr, esplit.node);
+    cnt = 0;
+    for (auto x : ssp) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(16, cnt);
+
+    auto isplit = ssp.split_front_inclusive(&intarr[15]);
+    DEFER(isplit.node = nullptr);
+    EXPECT_EQ(nullptr, ssp.node);
+    cnt = 0;
+    for (auto x : isplit) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(16, cnt);
+
+    auto psplit = isplit.split_by_predicate([](IntNode* x){ return x->x < 3; });
+    DEFER(psplit.node = nullptr);
+    cnt = 0;
+    for (auto x : psplit) {
+        EXPECT_EQ(cnt, x->x);
+        cnt++;
+    }
+    EXPECT_EQ(3, cnt);
+
+}
 
 int main(int argc, char** arg)
 {
     ::testing::InitGoogleTest(&argc, arg);
     google::ParseCommandLineFlags(&argc, &arg, true);
     default_audit_logger.log_output = log_output_stdout;
-    photon::thread_init();
-            set_log_output_level(ALOG_INFO);
+    photon::vcpu_init();
+    set_log_output_level(ALOG_DEBUG);
 
     if (FLAGS_vcpus <= 1)
     {
@@ -1525,10 +1883,10 @@ int main(int argc, char** arg)
     std::vector<std::thread> ths;
     for(int i=1; i<=FLAGS_vcpus; i++) {
         ths.emplace_back([i]{
-            photon::thread_init();
+            photon::vcpu_init();
             set_log_output_level(ALOG_INFO);
             run_all_tests(i);
-            photon::thread_fini();
+            photon::vcpu_fini();
         });
     }
 
@@ -1545,7 +1903,7 @@ int main(int argc, char** arg)
     //aSem.wait(10);
 
     wait_for_completion(0);
-    while(photon::thread_fini() != 0)
+    while(photon::vcpu_fini() != 0)
     {
         LOG_DEBUG("wait for other vCPU(s) to end");
         ::usleep(1000*1000);

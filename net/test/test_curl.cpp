@@ -42,7 +42,7 @@ class StringStream {
 };
 
 TEST(cURL, feature) {
-    photon::thread_init();
+    photon::vcpu_init();
     photon::fd_events_init();
     net::cURL::init();
 
@@ -53,12 +53,12 @@ TEST(cURL, feature) {
         client->GET("http://github.com", buffer.get());
     // }
     LOG_INFO(buffer->str().c_str());
-    buffer.release();
-    client.release();
+    buffer.reset();
+    client.reset();
 
     net::cURL::fini();
     photon::fd_events_fini();
-    photon::thread_fini();
+    photon::vcpu_fini();
 }
 
 int main(int argc, char** argv) {

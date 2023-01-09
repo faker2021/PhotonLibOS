@@ -29,6 +29,7 @@ limitations under the License.
 #include <photon/common/alog.h>
 #include <photon/thread/thread11.h>
 #include <photon/io/fd-events.h>
+#include "events_map.h"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -39,7 +40,8 @@ limitations under the License.
 
 namespace photon {
 
-static EventsMap<POLLIN | POLLRDHUP, POLLOUT, POLLERR> evmap(EVENT_READ, EVENT_WRITE, EVENT_ERROR);
+constexpr static EventsMap<EVUnderlay<POLLIN | POLLRDHUP, POLLOUT, POLLERR>>
+    evmap;
 
 class iouringEngine : public MasterEventEngine, public CascadingEventEngine {
 public:
@@ -73,6 +75,7 @@ public:
         if (setrlimit(RLIMIT_MEMLOCK, &resource_limit) != 0) {
             LOG_WARN("iouring: current user has no permission to set unlimited RLIMIT_MEMLOCK, change to root?");
         }
+        set_submit_wait_function();
 
         m_ring = new io_uring{};
         io_uring_params params{};
@@ -85,17 +88,10 @@ public:
         }
 
         // Check feature supported
-        if (!(params.features & IORING_FEAT_CUR_PERSONALITY)) {
-            LOG_ERROR_RETURN(0, -1, "iouring: feature IORING_FEAT_CUR_PERSONALITY not supported");
-        }
-        if (!(params.features & IORING_FEAT_NODROP)) {
-            LOG_ERROR_RETURN(0, -1, "iouring: feature IORING_FEAT_NODROP not supported");
-        }
-        if (!(params.features & IORING_FEAT_FAST_POLL)) {
-            LOG_ERROR_RETURN(0, -1, "iouring: feature IORING_FEAT_FAST_POLL not supported");
-        }
-        if (!(params.features & IORING_FEAT_EXT_ARG)) {
-            LOG_ERROR_RETURN(0, -1, "iouring: feature IORING_FEAT_EXT_ARG not supported");
+        for (auto i : REQUIRED_FEATURES) {
+            if (!(params.features & i)) {
+                LOG_ERROR_RETURN(0, -1, "iouring: required feature not supported");
+            }
         }
 
         // Check opcode supported
@@ -107,6 +103,12 @@ public:
         if (!io_uring_opcode_supported(probe, IORING_OP_PROVIDE_BUFFERS) ||
             !io_uring_opcode_supported(probe, IORING_OP_ASYNC_CANCEL)) {
             LOG_ERROR_RETURN(0, -1, "iouring: some opcodes are not supported");
+        }
+
+        // An additional feature only available since 5.18. Doesn't have to succeed
+        ret = io_uring_register_ring_fd(m_ring);
+        if (ret < 0 && ret != -EINVAL) {
+            LOG_ERROR_RETURN(EINVAL, -1, "iouring: unable to register ring fd", ret);
         }
 
         if (m_master) {
@@ -171,7 +173,7 @@ public:
                 errno = -io_ctx.res;
                 return -1;
             } else {
-                errno = 0;
+                // errno = 0;
                 return io_ctx.res;
             }
         } else {
@@ -210,7 +212,7 @@ public:
         }
 
         bool one_shot = e.interests & ONE_SHOT;
-        fdInterest fd_interest{e.fd, evmap.translate_bitwisely(e.interests)};
+        fdInterest fd_interest{e.fd, (uint32_t)evmap.translate_bitwisely(e.interests)};
         ioCtx io_ctx{CURRENT, -1, false, true};
         eventCtx event_ctx{e, one_shot, io_ctx};
         auto pair = m_event_contexts.insert({fd_interest, event_ctx});
@@ -233,13 +235,13 @@ public:
             LOG_ERROR_RETURN(EBUSY, -1, "iouring: submission queue is full");
         }
 
-        fdInterest fd_interest{e.fd, evmap.translate_bitwisely(e.interests)};
+        fdInterest fd_interest{e.fd, (uint32_t)evmap.translate_bitwisely(e.interests)};
         auto iter = m_event_contexts.find(fd_interest);
         if (iter == m_event_contexts.end()) {
             LOG_ERROR_RETURN(0, -1, "iouring: event is either non-existent or one-shot finished");
         }
 
-        io_uring_prep_poll_remove(sqe, &iter->second.io_ctx);
+        io_uring_prep_poll_remove(sqe, (__u64) &iter->second.io_ctx);
         io_uring_sqe_set_data(sqe, nullptr);
         return 0;
     }
@@ -248,7 +250,7 @@ public:
         // Use master engine to wait for self event fd
         int ret = get_vcpu()->master_event_engine->wait_for_fd_readable(m_cascading_event_fd, timeout);
         if (ret < 0) {
-            return ret;
+            return errno == ETIMEDOUT ? 0 : -1;
         }
         uint64_t value = 0;
         if (eventfd_read(m_cascading_event_fd, &value)) {
@@ -275,7 +277,7 @@ public:
                 LOG_ERROR_RETURN(0, -1, "iouring: only cascading engine need to handle event. Must be a bug...")
             }
             eventCtx* event_ctx = container_of(ctx, eventCtx, io_ctx);
-            fdInterest fd_interest{event_ctx->event.fd, evmap.translate_bitwisely(event_ctx->event.interests)};
+            fdInterest fd_interest{event_ctx->event.fd, (uint32_t)evmap.translate_bitwisely(event_ctx->event.interests)};
             if (ctx->res == -ECANCELED) {
                 m_event_contexts.erase(fd_interest);
             } else if (event_ctx->one_shot) {
@@ -299,20 +301,12 @@ public:
             timeout = std::numeric_limits<int64_t>::max();
         }
         usec_to_timespec(timeout, &ts);
-        io_uring_sqe* sqe = io_uring_get_sqe(m_ring);
-        if (!sqe) {
-            LOG_ERROR_RETURN(EBUSY, -1, "iouring: submission queue is full");
-        }
-        io_uring_prep_timeout(sqe, &ts, 1, 0);
-        io_uring_sqe_set_data(sqe, nullptr);
-
-        // Batch submit all SQEs
-        int ret = io_uring_submit_and_wait(m_ring, 1);
-        if (ret <= 0) {
-            LOG_ERROR_RETURN(0, -1, "iouring: failed to submit io")
-        }
 
         io_uring_cqe* cqe = nullptr;
+        if (m_submit_wait_func(m_ring, &ts, &cqe) != 0) {
+            return -1;
+        }
+
         uint32_t head = 0;
         unsigned i = 0;
         io_uring_for_each_cqe(m_ring, head, cqe) {
@@ -381,6 +375,48 @@ private:
         }
     };
 
+    static int submit_wait_by_timer(io_uring* ring, __kernel_timespec* ts, io_uring_cqe** cqe) {
+        io_uring_sqe* sqe = io_uring_get_sqe(ring);
+        if (!sqe) {
+            LOG_ERROR_RETURN(EBUSY, -1, "iouring: submission queue is full");
+        }
+        io_uring_prep_timeout(sqe, ts, 1, 0);
+        io_uring_sqe_set_data(sqe, nullptr);
+
+        // Batch submit all SQEs
+        int ret = io_uring_submit_and_wait(ring, 1);
+        if (ret <= 0) {
+            LOG_ERROR_RETURN(0, -1, "iouring: failed to submit io")
+        }
+        return 0;
+    }
+
+    static int submit_wait_by_api(io_uring* ring, __kernel_timespec* ts, io_uring_cqe** cqe) {
+        // Batch submit all SQEs
+        int ret = io_uring_submit_and_wait_timeout(ring, cqe, 1, ts, nullptr);
+        if (ret < 0 && ret != -ETIME) {
+            LOG_ERROR_RETURN(0, -1, "iouring: failed to submit io");
+        }
+        return 0;
+    }
+
+    using SubmitWaitFunc = int (*)(io_uring* ring, __kernel_timespec* ts, io_uring_cqe** cqe);
+    static SubmitWaitFunc m_submit_wait_func;
+
+    static void set_submit_wait_function() {
+        // The submit_and_wait_timeout API is more efficient than setting up a timer and waiting for it.
+        // But there is a kernel bug before 5.17, so choose appropriate function here.
+        // See https://git.kernel.dk/cgit/linux-block/commit/?h=io_uring-5.17&id=228339662b398a59b3560cd571deb8b25b253c7e
+        if (m_submit_wait_func)
+            return;
+        int result;
+        if (kernel_version_compare("5.17", result) == 0 && result >= 0) {
+            m_submit_wait_func = submit_wait_by_api;
+        } else {
+            m_submit_wait_func = submit_wait_by_timer;
+        }
+    }
+
     void run_cancel_poller() {
         while (m_cancel_poller_running) {
             uint32_t poll_mask = evmap.translate_bitwisely(EVENT_READ);
@@ -405,7 +441,11 @@ private:
         ts->tv_nsec = nsec;
     }
 
-    static const int QUEUE_DEPTH = 32768;
+    static constexpr const uint32_t REQUIRED_FEATURES[] = {
+            IORING_FEAT_CUR_PERSONALITY, IORING_FEAT_NODROP,
+            IORING_FEAT_FAST_POLL, IORING_FEAT_EXT_ARG,
+            IORING_FEAT_RW_CUR_POS};
+    static const int QUEUE_DEPTH = 16384;
     bool m_master;
     int m_cascading_event_fd = -1;
     io_uring* m_ring = nullptr;
@@ -414,6 +454,10 @@ private:
     bool m_cancel_poller_running = true;
     std::unordered_map<fdInterest, eventCtx, fdInterestHasher> m_event_contexts;
 };
+
+constexpr const uint32_t iouringEngine::REQUIRED_FEATURES[];
+
+iouringEngine::SubmitWaitFunc iouringEngine::m_submit_wait_func = nullptr;
 
 ssize_t iouring_pread(int fd, void* buf, size_t count, off_t offset, uint64_t timeout) {
     auto ee = (iouringEngine*) get_vcpu()->master_event_engine;

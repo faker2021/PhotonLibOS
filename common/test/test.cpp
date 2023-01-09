@@ -94,7 +94,7 @@ TEST(ALog, DEC) {
 
 TEST(ALog, DoubleLogger) {
     LogOutputTest lo2;
-    ALogLogger l2(0, &lo2);
+    ALogLogger l2{0, &lo2};
     log_output = &log_output_test;
     DEFER(log_output = log_output_stdout);
     // LOG_DEBUG(' ');
@@ -1524,7 +1524,10 @@ void* objcache(void* arg) {
     auto args = (OCArg*)arg;
     auto oc = args->oc;
     auto id = args->id;
-    auto ctor = [&]() { return new ShowOnDtor(id); };
+    auto ctor = [&]() {
+        cycle_cnt++;
+        return new ShowOnDtor(id);
+    };
     // acquire every 10ms
     photon::thread_usleep(10*1000UL * id);
     auto ret = oc->acquire(0, ctor);
@@ -1535,14 +1538,13 @@ void* objcache(void* arg) {
     if (id % 10 == 0) LOG_INFO("Cycle ", VALUE(id));
     // every 10 objs will recycle
     oc->release(0, id % 10 == 0);
-    if (id % 10 == 0) cycle_cnt ++;
     LOG_DEBUG("Released ", VALUE(id));
     return 0;
 }
 
 TEST(ObjectCache, release_cycle) {
-    // photon::thread_init();
-    // DEFER(photon::thread_fini());
+    // photon::vcpu_init();
+    // DEFER(photon::vcpu_fini());
     set_log_output_level(ALOG_INFO);
     DEFER(set_log_output_level(ALOG_DEBUG));
     ObjectCache<int, ShowOnDtor*> ocache(1000UL * 1000 * 10);
@@ -1566,8 +1568,8 @@ TEST(ObjectCache, release_cycle) {
 
 TEST(ObjectCache, timeout_refresh) {
     release_cnt = 0;
-    // photon::thread_init();
-    // DEFER(photon::thread_fini());
+    // photon::vcpu_init();
+    // DEFER(photon::vcpu_fini());
     set_log_output_level(ALOG_INFO);
     DEFER(set_log_output_level(ALOG_DEBUG));
     ObjectCache<int, ShowOnDtor*> ocache(1000UL * 1000);
@@ -1593,8 +1595,8 @@ void* ph_act(void* arg) {
 
 TEST(ObjectCache, ctor_may_yield_and_null) {
     release_cnt = 0;
-    // photon::thread_init();
-    // DEFER(photon::thread_fini());
+    // photon::vcpu_init();
+    // DEFER(photon::vcpu_fini());
     set_log_output_level(ALOG_INFO);
     DEFER(set_log_output_level(ALOG_DEBUG));
     ObjectCache<int, ShowOnDtor*> ocache(1000UL * 1000);
@@ -1612,8 +1614,8 @@ TEST(ObjectCache, ctor_may_yield_and_null) {
 }
 
 TEST(ObjectCache, multithread) {
-    // photon::thread_init();
-    // DEFER(photon::thread_fini());
+    // photon::vcpu_init();
+    // DEFER(photon::vcpu_fini());
     set_log_output_level(ALOG_INFO);
     DEFER(set_log_output_level(ALOG_DEBUG));
     ObjectCache<int, ShowOnDtor*> ocache(1000UL * 1000 * 10);
@@ -1623,8 +1625,8 @@ TEST(ObjectCache, multithread) {
     std::vector<std::thread> ths;
     for (int i = 0; i < 10; i++) {
         ths.emplace_back([&] {
-            photon::thread_init();
-            DEFER(photon::thread_fini());
+            photon::vcpu_init();
+            DEFER(photon::vcpu_fini());
             std::vector<photon::join_handle*> handles;
             std::vector<OCArg> args;
             for (int i = 0; i < 100; i++) {
@@ -1680,8 +1682,8 @@ TEST(ObjectCache, borrow) {
     std::vector<std::thread> ths;
     for (int i = 0; i < 10; i++) {
         ths.emplace_back([&] {
-            photon::thread_init();
-            DEFER(photon::thread_fini());
+            photon::vcpu_init();
+            DEFER(photon::vcpu_fini());
             std::vector<photon::join_handle*> handles;
             std::vector<OCArg> args;
             for (int i = 0; i < 100; i++) {
@@ -1704,8 +1706,8 @@ TEST(ObjectCache, borrow) {
 }
 
 TEST(ExpireContainer, expire_container) {
-    // photon::thread_init();
-    // DEFER(photon::thread_fini());
+    // photon::vcpu_init();
+    // DEFER(photon::vcpu_fini());
     char key[10] = "hello";
     char key2[10] = "hello";
     ExpireContainer<std::string, int, bool> expire(1000*1000); // expire in 100ms
@@ -1713,7 +1715,7 @@ TEST(ExpireContainer, expire_container) {
     memset(key2, 0, sizeof(key2));
     auto it = expire.find(key);
     EXPECT_NE(expire.end(), it);
-    auto ref = it->get();
+    auto ref = *it;
     EXPECT_EQ(0, strcmp(ref->key().data(), key));
     EXPECT_EQ(0, strcmp(ref->get_payload<0>().data(), key));
     EXPECT_EQ(-1, ref->get_payload<1>());
@@ -1729,16 +1731,30 @@ TEST(ExpireContainer, expire_container) {
     EXPECT_EQ(expire.end(), it);
 }
 
+TEST(ExpireContainer, refresh) {
+    char key[] = "hello";
+    char key2[] = "wtf";
+    ExpireContainer<std::string, int, bool> expire(1000*1000);
+    auto it = expire.insert(key, 0, true);
+    expire.insert(key2, 1, true);
+    photon::thread_usleep(900 * 1000);
+    expire.expire();
+    expire.refresh(*it);
+    photon::thread_usleep(900 * 1000);
+    expire.expire();
+    EXPECT_NE(expire.end(), expire.find(key));
+    EXPECT_EQ(expire.end(), expire.find(key2));
+}
 
 TEST(ExpireList, expire_container) {
-    // photon::thread_init();
-    // DEFER(photon::thread_fini());
+    // photon::vcpu_init();
+    // DEFER(photon::vcpu_fini());
     char key[10] = "hello";
     ExpireList<std::string> expire(1000*1000); // expire in 100ms
     expire.keep_alive(key, true);
     auto it = expire.find(key);
     EXPECT_NE(expire.end(), it);
-    auto ref = it->get();
+    auto ref = *it;
     EXPECT_EQ(0, strcmp(ref->key().data(), key));
     expire.expire();
     it = expire.find(key);
@@ -1805,6 +1821,8 @@ struct LevelOutput : public ILogOutput {
     uint64_t set_throttle(uint64_t t = -1UL) override { return 0; }
 
     uint64_t get_throttle() override { return 0; };
+
+    void destruct() override {}
 };
 
 TEST(ALog, level_in_output) {
@@ -1850,8 +1868,8 @@ TEST(ALog, log_audit) {
 // #endif
 int main(int argc, char **argv)
 {
-    photon::thread_init();
-    DEFER(photon::thread_fini());
+    photon::vcpu_init();
+    DEFER(photon::vcpu_fini());
     char a[100]{}, b[100]{};
     memset(a, 1, sizeof(a));
     memcpy(b, a, sizeof(a));

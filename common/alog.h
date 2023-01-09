@@ -25,15 +25,20 @@ limitations under the License.
 #include <type_traits>
 
 #include <photon/common/utility.h>
-#include <photon/common/object.h>
 #include <photon/common/conststr.h>
 
-class ILogOutput : public Object {
+class ILogOutput {
+protected:
+    // output object should be destructed via `destruct()`
+    // make alog to used in the construct/destruct of global variables
+    ~ILogOutput() = default;
+
 public:
     virtual void write(int level, const char* begin, const char* end) = 0;
     virtual int get_log_file_fd() = 0;
     virtual uint64_t set_throttle(uint64_t t = -1UL) = 0;
     virtual uint64_t get_throttle() = 0;
+    virtual void destruct() = 0;
 };
 
 extern ILogOutput * const log_output_null;
@@ -41,7 +46,8 @@ extern ILogOutput * const log_output_stderr;
 extern ILogOutput * const log_output_stdout;
 
 ILogOutput* new_log_output_file(const char* fn, uint64_t rotate_limit = UINT64_MAX, int max_log_files = 10, uint64_t throttle = -1UL);
-ILogOutput* new_log_output_file(int fd, uint64_t rotate_limit = UINT64_MAX, uint64_t throttle = -1UL);
+ILogOutput* new_log_output_file(int fd, uint64_t throttle = -1UL);
+ILogOutput* new_async_log_output(ILogOutput* output);
 
 // old-style log_output_file & log_output_file_close
 // return 0 when successed, -1 for failed
@@ -88,7 +94,7 @@ protected:
     char _shift;
     char _width = 0;
     char _padding = ' ';
-    char _comma = false;
+    bool _comma = false;
     bool _lower = false;
     bool _signed;
 };
@@ -142,7 +148,7 @@ struct ALogString
     const char* const s;
     size_t size;
 
-    constexpr ALogString(const char* s, size_t n) : s(s), size(n) { }
+    constexpr ALogString(const char* s_, size_t n) : s(s_), size(n) { }
 
     constexpr char operator[](size_t i) const { return s[i]; }
 };
@@ -152,7 +158,7 @@ struct ALogStringL : public ALogString
     using ALogString::ALogString;
 
     template<size_t N> constexpr
-    ALogStringL(const char (&s)[N]) : ALogString(s, N-1) { }
+    ALogStringL(const char (&s_)[N]) : ALogString(s_, N-1) { }
 };
 
 struct ALogStringPChar : public ALogString
@@ -276,11 +282,8 @@ protected:
 
 struct LogBuffer;
 struct ALogLogger {
-    int log_level = ALOG_DEBUG;
-    ILogOutput* log_output = log_output_stdout;
-
-    ALogLogger(int level = 0, ILogOutput* output = log_output_stdout)
-        : log_level(level), log_output(output) {}
+    int log_level;
+    ILogOutput* log_output;
 
     template <typename T>
     ALogLogger& operator<<(T&& rhs) {
@@ -415,10 +418,10 @@ struct LogBuilder {
     ALogLogger* logger;
     bool done;
 
-    LogBuilder(int level, BuilderType&& builder, ALogLogger* logger)
-        : level(level),
-          builder(std::forward<BuilderType>(builder)),
-          logger(logger),
+    LogBuilder(int level_, BuilderType&& builder_, ALogLogger* logger_)
+        : level(level_),
+          builder(std::forward<BuilderType>(builder_)),
+          logger(logger_),
           done(false) {}
     LogBuilder(LogBuilder&& rhs)
         : level(rhs.level),
@@ -467,7 +470,7 @@ struct LogBuilder {
             }                                                            \
         };                                                               \
         LogBuilder<decltype(__build_lambda__)>(                          \
-            level, std::move(__build_lambda__), &logger);                \
+            level, ::std::move(__build_lambda__), &logger);                \
     })
 
 #define LOG_DEBUG(...) (__LOG__(default_logger, ALOG_DEBUG, __VA_ARGS__))
@@ -496,7 +499,7 @@ struct ERRNO
 {
     const int no;
     ERRNO() : no(errno) { }
-    constexpr ERRNO(int no) : no(no) { }
+    constexpr ERRNO(int no_) : no(no_) { }
 };
 
 inline LogBuffer& operator << (LogBuffer& log, ERRNO e)

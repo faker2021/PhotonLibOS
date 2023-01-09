@@ -580,6 +580,22 @@ namespace fs
         {
             return PERFORM(statvfs, path, buf);
         }
+        virtual int utime(const char *path, const struct utimbuf *file_times) override
+        {
+            return PERFORM(utime, path, file_times);
+        }
+        virtual int utimes(const char *path, const struct timeval times[2]) override
+        {
+            return PERFORM(utimes, path, times);
+        }
+        virtual int lutimes(const char *path, const struct timeval times[2]) override
+        {
+            return PERFORM(lutimes, path, times);
+        }
+        virtual int mknod(const char *path, mode_t mode, dev_t dev) override
+        {
+            return PERFORM(mknod, path, mode, dev);
+        }
     };
 
     template<typename UIF, typename Performer, typename...Timeout>

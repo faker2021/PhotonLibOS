@@ -27,11 +27,11 @@ limitations under the License.
 #include <photon/thread/timer.h>
 #include <photon/common/timeout.h>
 #include <photon/common/utility.h>
+#include <photon/net/security-context/tls-stream.h>
 
 namespace photon {
 namespace net {
 static constexpr int poll_size = 16;
-static constexpr int EOK = ENXIO;
 
 class cURLLoop;
 struct CurlThCtx {
@@ -166,12 +166,7 @@ protected:
 
     int wait_fds(EventLoop*) {
         cnt = cctx.g_poller->wait_for_events((void**)&cbs, poll_size);
-        if (cnt > 0) return 1;
-        if (cnt < 0 && errno == ETIMEDOUT) {
-            return 0;
-        }
-        if (cnt < 0 || errno == EINTR) return -1;
-        return 0;
+        return cnt;
     }
 
     int on_poll(EventLoop*) {
@@ -188,39 +183,22 @@ protected:
 int libcurl_set_pipelining(long val) {
     return curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_PIPELINING, val);
 }
-// this feature seems not able to use in 7.29.0
+
 int libcurl_set_maxconnects(long val) {
-    return curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-                             val);
-    // return 0;
-}
-
-static std::vector<std::unique_ptr<std::mutex>> mutex_buf;
-
-static void locking_function(int mode, int n, const char* file, int line) {
-    if (mode & CRYPTO_LOCK) {
-        mutex_buf[n]->lock();
-    } else {
-        mutex_buf[n]->unlock();
-    }
-}
-
-static unsigned long id_function(void) {
-    return ((unsigned long)pthread_self());
-}
-
-int thread_setup(void) {
-    while((ssize_t)mutex_buf.size() < CRYPTO_num_locks()) {
-        mutex_buf.emplace_back(new std::mutex());
-    }
-    CRYPTO_set_id_callback(id_function);
-    CRYPTO_set_locking_callback(locking_function);
-    return 1;
+#if LIBCURL_VERSION_MAJOR > 7 || LIBCURL_VERSION_MAJOR == 7 && LIBCURL_VERSION_MINOR >= 30
+    return curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, val);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 __attribute__((constructor)) void global_init() {
     global_initialized = curl_global_init(CURL_GLOBAL_ALL);
 }
+
+// Fuction defined in tls-stream.
+void __OpenSSLGlobalInit();
 
 // Since global cleanup will cleanup openssl
 // it needs mutex_buf, which will be destructed before global fini
@@ -233,8 +211,8 @@ __attribute__((constructor)) void global_init() {
 
 int libcurl_init(long flags, long pipelining, long maxconn) {
     if (cctx.g_loop == nullptr) {
-        thread_setup();
-        cctx.g_poller = photon::new_epoll_cascading_engine();
+        __OpenSSLGlobalInit();
+        cctx.g_poller = photon::new_default_cascading_engine();
         cctx.g_loop = new cURLLoop();
         cctx.g_loop->start();
         cctx.g_timer =
@@ -255,7 +233,9 @@ int libcurl_init(long flags, long pipelining, long maxconn) {
         curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_SOCKETFUNCTION, sock_cb);
         curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_TIMERFUNCTION, timer_cb);
         curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_MAXCONNECTS, 0);
+#if LIBCURL_VERSION_MAJOR > 7 || LIBCURL_VERSION_MAJOR == 7 && LIBCURL_VERSION_MINOR >= 30
         curl_multi_setopt(cctx.g_libcurl_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 0);
+#endif
 
         libcurl_set_pipelining(pipelining);
         libcurl_set_maxconnects(maxconn);

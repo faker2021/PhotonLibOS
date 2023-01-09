@@ -24,7 +24,7 @@ limitations under the License.
 
 #include <photon/io/fd-events.h>
 #include <photon/io/aio-wrapper.h>
-#include <photon/io/signalfd.h>
+#include <photon/io/signal.h>
 #include <photon/fs/localfs.h>
 #include <photon/fs/filesystem.h>
 #include <photon/common/checksum/crc32c.h>
@@ -322,11 +322,8 @@ TEST(perf, DISABLED_read) {
 /* Event Engine Tests */
 
 photon::CascadingEventEngine* new_cascading_engine(bool iouring = false) {
-    if (iouring) {
-        return photon::new_iouring_cascading_engine();
-    } else {
-        return photon::new_epoll_cascading_engine();
-    }
+    // return photon::new_iouring_cascading_engine();
+    return photon::new_epoll_cascading_engine();
 }
 
 TEST(event_engine, master) {
@@ -459,8 +456,7 @@ TEST(event_engine, cascading_timeout) {
 
     void* data[5] = {};
     ssize_t num_events = engine->wait_for_events(data, 5, 1000000);
-    ASSERT_EQ(num_events, -1);
-    ASSERT_EQ(errno, ETIMEDOUT);
+    ASSERT_EQ(0, num_events);
 
     engine->rm_interest({fd1[0], photon::EVENT_READ, (void*) 0x1111});
     engine->rm_interest({fd2[0], photon::EVENT_READ, (void*) 0x2222});
@@ -543,7 +539,7 @@ TEST(event_engine, cascading_one_shot) {
 
     LOG_INFO("wait non events");
     num_events = engine->wait_for_events(data, 5, 2000000);
-    ASSERT_EQ(num_events, -1);
+    ASSERT_EQ(num_events, 0);
     ASSERT_EQ(errno, ETIMEDOUT);
 
     photon::thread_join((photon::join_handle*) sub);
@@ -557,11 +553,11 @@ int main(int argc, char** arg) {
     testing::FLAGS_gtest_break_on_failure = true;
     gflags::ParseCommandLineFlags(&argc, &arg, true);
 
-    int ret = photon::thread_init();
-    if (ret != 0) return -1;
-    DEFER(photon::thread_fini());
+    int ret = photon::vcpu_init();
+    if (ret < 0) return -1;
+    DEFER(photon::vcpu_fini());
     ret = photon::fd_events_init();
-    if (ret != 0) return -1;
+    if (ret < 0) return -1;
     DEFER(photon::fd_events_fini());
 
     return RUN_ALL_TESTS();

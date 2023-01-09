@@ -21,9 +21,11 @@ limitations under the License.
 #include <cassert>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <sys/uio.h>
 #include <photon/common/iovector.h>
 #include <photon/common/utility.h>
+#include <photon/common/checksum/crc32c.h>
 
 namespace photon {
 namespace rpc
@@ -62,16 +64,15 @@ namespace rpc
         array(const T* ptr, size_t size) { assign(ptr, size); }
         array(const std::vector<T>& vec) { assign(vec); }
         size_t size() const { return _len / sizeof(T); }
-        const T* begin() const    { return (T*)_ptr; }
-        const T* end() const      { return begin() + size(); }
+        T* begin() const { return (T*)_ptr; }
+        T* end() const { return begin() + size(); }
+        const T* cbegin() const { return begin(); }
+        const T* cend() const { return end(); }
         const T& operator[](long i) const { return ((char*)_ptr)[i]; }
         const T& front() const    { return (*this)[0]; }
         const T& back() const     { return (*this)[(long)size() - 1]; }
         void assign(const T* x, size_t size) { buffer::assign(x, sizeof(*x) * size); }
-        void assign(const std::vector<T>& vec)
-        {
-            assign(&vec[0], vec.size());
-        }
+        void assign(const std::vector<T>& vec) { assign(&vec[0], vec.size()); }
 
         struct iterator {
             T* p;
@@ -100,10 +101,15 @@ namespace rpc
         template<size_t LEN>
         string(const char (&s)[LEN]) : base(s, LEN) { }
         string(const char* s) : base(s, strlen(s)+1) { }
+        string(const char* s, size_t len) : base(s, len) { }
         string(const std::string& s) { assign(s); }
         string() : base(nullptr, 0) { }
-        const char* c_str() const { return begin(); }
-        operator const char* () const { return c_str(); }
+        const char* c_str() const { return cbegin(); }
+        std::string_view sv() const { return {c_str(), size()}; }
+        bool operator==(const string& rhs) const { return sv() == rhs.sv(); }
+        bool operator!=(const string& rhs) const { return !(*this == rhs); }
+        bool operator<(const string& rhs) const { return sv() < rhs.sv(); }
+        bool operator>(const string& rhs) const { return !(*this < rhs); }
         void assign(const char* s) {
             base::assign(s, strlen(s) + 1);
         }
@@ -111,6 +117,71 @@ namespace rpc
         {
             array<char>::assign(s.c_str(), s.size()+1);
         }
+    };
+
+    template<typename T1, typename T2>
+    struct pair {
+        pair() = default;
+        pair(T1 t1, T2 t2) : first(t1), second(t2) {}
+
+        T1 first;
+        T2 second;
+    };
+
+    // slice can be anchored to a base_buffer to form a new string
+    class slice {
+    public:
+        slice() = default;
+
+        slice(off_t off, size_t len) : offset(off), length(len) {}
+
+        string anchor(const buffer& base_buffer) const {
+            assert(offset + length <= base_buffer.size());
+            return {(char*) base_buffer.addr() + offset, length};
+        }
+
+        off_t offset;
+        size_t length;
+    };
+
+    inline string operator|(slice s, const buffer& base) {
+        return s.anchor(base);
+    }
+
+    inline string operator|(string s, const buffer& base) {
+        return s;
+    }
+
+    inline string operator|(const char* s, const buffer& base) {
+        return {s, strlen(s)};
+    }
+
+    inline string operator|(std::string_view s, const buffer& base) {
+        return {s.data(), s.size()};
+    }
+
+    inline string operator|(std::string s, const buffer& base) {
+        return {s.data(), s.size()};
+    }
+
+    inline string operator|(pair<slice, slice> p, const buffer& base) {
+        return p.first.anchor(base);
+    }
+
+    // A function object to compare rpc::slice, rpc::string, std::string, const char*, and so on.
+    // Some of them may need to be anchored to a base_buffer
+    class base_buffer_cmp {
+    public:
+        explicit base_buffer_cmp(buffer* base_buffer) : m_base_buffer(base_buffer) {}
+
+        template<typename A, typename B>
+        bool operator()(const A& a, const B& b) {
+            assert(m_base_buffer);
+            return (a | *m_base_buffer) < (b | *m_base_buffer);
+        }
+
+    private:
+        buffer* m_base_buffer;
     };
 
     struct iovec_array : public array<iovec>
@@ -146,14 +217,16 @@ namespace rpc
     };
 
     // structs of concrete messages MUST derive from `Message`,
-    // and implement serialize_fields(), possbile with SERIALIZE_FIELDS()
+    // and implement serialize_fields(), possible with SERIALIZE_FIELDS()
     struct Message
     {
     public:
         template<typename AR>
-        void serialize_fields(AR& ar)
-        {
-        }
+        void serialize_fields(AR& ar) {}
+
+        void add_checksum(iovector* iov) {}
+
+        bool validate_checksum(iovector* iov, void* body, size_t body_length) { return true; }
 
     protected:
         template<typename AR>
@@ -168,13 +241,56 @@ namespace rpc
         }
     };
 
+    struct Crc32Hasher {
+        using ValueType = uint32_t;
+
+        static constexpr ValueType init_value() { return 0; };
+
+        static void extend_hash(ValueType& value, const iovector* iov) {
+            for (const auto iter : *iov)
+                value = crc32c_extend(iter.iov_base, iter.iov_len, value);
+        }
+
+        static void extend_hash(ValueType& value, void* buf, size_t length) {
+            value = crc32c_extend(buf, length, value);
+        }
+    };
+
+    template<typename Hasher = Crc32Hasher>
+    struct CheckedMessage : public Message {
+    public:
+        using ValueType = typename Hasher::ValueType;
+
+        CheckedMessage() : m_checksum(Hasher::init_value()) {}
+
+        void add_checksum(iovector* iov) {
+            assert(m_checksum == Hasher::init_value());
+            Hasher::extend_hash(m_checksum, iov);
+        }
+
+        bool validate_checksum(iovector* iov, void* body, size_t body_length) {
+            auto dst = m_checksum;
+            m_checksum = Hasher::init_value();
+            Hasher::extend_hash(m_checksum, iov);
+            if (body != nullptr && body_length != 0)
+                Hasher::extend_hash(m_checksum, body, body_length);
+            if (dst != m_checksum)
+                return false;
+            return true;
+        }
+
+    private:
+        ValueType m_checksum;
+    };
+
 #define PROCESS_FIELDS(...)                     \
         template<typename AR>                   \
         void process_fields(AR& ar) {           \
             return reduce(ar, __VA_ARGS__);     \
         }
 
-
+    template<typename K, typename V>
+    struct sorted_map;
 
     template<typename Derived>  // The Curiously Recurring Template Pattern (CRTP)
     class ArchiveBase
@@ -226,6 +342,12 @@ namespace rpc
         void process_field(iovec_array& x)
         {
             assert("must be re-implemented in derived classes");
+        }
+
+        template<typename K, typename V>
+        void process_field(sorted_map<K, V>& x) {
+            d()->process_field(x.index);
+            d()->process_field(x.base_buffer);
         }
 
         // overload for embedded Message
@@ -308,6 +430,7 @@ namespace rpc
             x.process_fields(non_aligned);
             buffer msg(&x, sizeof(x));
             d()->process_field(msg);
+            x.add_checksum(&iov);
         }
     };
 
@@ -350,6 +473,10 @@ namespace rpc
             _iov=iov;
             auto t = iov -> extract_back<T>();
             if (t) {
+                if (!t->validate_checksum(iov, t, sizeof(*t))) {
+                    failed = true;
+                    return nullptr;
+                }
                 // deserialize aligned fields, and non-aligned fields, from front
                 auto aligned = FilterAlignedFields(this, true);
                 t->process_fields(aligned);
@@ -361,5 +488,107 @@ namespace rpc
             return t;
         }
     };
+
+    // The actual protocol struct sent in an RPC message
+    template<typename K, typename V>
+    struct sorted_map {
+        using KeyType = slice;
+        using ValueType = pair<slice, slice>;
+        using MappedType = slice;
+        using KeyCompare = base_buffer_cmp;
+        using Index = array<ValueType>;
+
+        struct Iterator {
+            using iterator_category = std::forward_iterator_tag;
+            using difference_type   = std::ptrdiff_t;
+
+            Iterator(ValueType* ptr, buffer* base_buffer) : m_ptr(ptr), m_base_buffer(base_buffer) {}
+
+            pair<K, V>& operator*() { deserialize(); return m_pair; }
+            pair<K, V>* operator->() { deserialize(); return &m_pair; }
+            Iterator& operator++() { m_ptr++; return *this; }
+            Iterator operator++(int) { Iterator tmp = *this; ++(*this); return tmp; }
+            friend bool operator== (const Iterator& a, const Iterator& b) { return a.m_ptr == b.m_ptr; };
+            friend bool operator!= (const Iterator& a, const Iterator& b) { return a.m_ptr != b.m_ptr; };
+
+        private:
+            void deserialize() {
+                photon::rpc::string s = m_ptr->second | *m_base_buffer;
+                IOVector iov;
+                iov.push_back(s.addr(), s.size());
+                DeserializerIOV deserializer;
+                auto* t = deserializer.deserialize<V>(&iov);
+
+                m_pair.first = m_ptr->first | *m_base_buffer;
+                m_pair.second = *t;
+            }
+
+            ValueType* m_ptr;
+            buffer* m_base_buffer;
+            pair<K, V> m_pair;
+        };
+
+        Iterator begin() { return Iterator(index.begin(), &base_buffer); }
+
+        Iterator end() { return Iterator(index.end(), &base_buffer); }
+
+        Iterator find(const K& k) {
+            auto iter = std::lower_bound(index.begin(), index.end(), k, KeyCompare(&base_buffer));
+            return Iterator(iter, &base_buffer);
+        }
+
+        Index index;
+        buffer base_buffer;
+    };
+
+    template<typename K, typename V>
+    class sorted_map_factory {
+    public:
+        using SortedMap = sorted_map<K, V>;
+
+        ~sorted_map_factory() {
+            if (m_flat_buffer)
+                free(m_flat_buffer);
+        }
+
+        // Append key and value into a temp iov, and append the index
+        void append(const K& k, const V& v) {
+            static_assert(std::is_base_of<photon::rpc::string, K>::value, "Only support rpc::string as key for now");
+            static_assert(std::is_base_of<Message, V>::value, "The value must be a RPC message");
+
+            off_t offset = m_iov.sum();
+            m_iov.push_back(k.addr(), k.size() + 1);
+            typename SortedMap::KeyType key_slice(offset, k.size());
+
+            offset = m_iov.sum();
+            SerializerIOV serializer;
+            serializer.serialize((V&) v);
+            size_t value_size = serializer.iov.sum();
+            for (auto each : serializer.iov) {
+                m_iov.push_back(each.iov_base, each.iov_len);
+            }
+            typename SortedMap::MappedType val_slice(offset, value_size);
+
+            m_index.emplace_back(key_slice, val_slice);
+        }
+
+        // Flatten the iov to a buffer, and bind the external sorted_map with this buffer.
+        // Should be used in send side.
+        void assign_to(SortedMap* sm) {
+            if (m_index.empty())
+                return;
+            m_flat_buffer = malloc(m_iov.sum());
+            m_iov.memcpy_to(m_flat_buffer, m_iov.sum());
+            sm->base_buffer.assign(m_flat_buffer, m_iov.sum());
+            std::sort(m_index.begin(), m_index.end(), typename SortedMap::KeyCompare(&sm->base_buffer));
+            sm->index.assign(m_index);
+        }
+
+    protected:
+        std::vector<typename SortedMap::ValueType> m_index;
+        IOVector m_iov;
+        void* m_flat_buffer = nullptr;
+    };
+
 }
 }

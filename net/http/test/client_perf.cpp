@@ -24,7 +24,6 @@ limitations under the License.
 #include <photon/net/http/client.h>
 #include <photon/net/curl.h>
 #include <photon/net/socket.h>
-#include <photon/net/etsocket.h>
 #include <photon/common/alog.h>
 #include <photon/common/alog-stdstring.h>
 #include <photon/io/fd-events.h>
@@ -113,20 +112,20 @@ void test_curl(result &res) {
     }
     res.t_end = GetSteadyTimeUs();
 }
-void client_thread_entry(result *res, net::Client *client, int idx) {
+void client_thread_entry(result *res, net::http::Client *client, int idx) {
     std::string body_buf;
     body_buf.resize(FLAGS_body_size);
     std::string target = "http://" + FLAGS_ip + ":" + std::to_string(FLAGS_port);
     for (uint64_t i = 0; i < FLAGS_count; i++) {
         auto t_begin = GetSteadyTimeUs();
-        net::Client::OperationOnStack<8 * 1024> operation(client, net::Verb::GET, target);
+        net::http::Client::OperationOnStack<8 * 1024> operation(client, net::http::Verb::GET, target);
         auto op = &operation;
         client->call(op);
-        if (op->resp.content_length() != FLAGS_body_size) {
-            LOG_ERROR(VALUE(op->resp.content_length()), VALUE(errno), VALUE(i), VALUE(FLAGS_body_size));
+        if (op->resp.headers.content_length() != FLAGS_body_size) {
+            LOG_ERROR(VALUE(op->resp.headers.content_length()), VALUE(errno), VALUE(i), VALUE(FLAGS_body_size));
             res->failed = true;
         }
-        auto ret = op->resp_body->read((void*)body_buf.data(), FLAGS_body_size);
+        auto ret = op->resp.read((void*)body_buf.data(), FLAGS_body_size);
         if (ret != FLAGS_body_size) {
             LOG_ERROR(VALUE(ret), VALUE(errno), VALUE(i), VALUE(FLAGS_body_size));
             res->failed = true;
@@ -139,7 +138,7 @@ void client_thread_entry(result *res, net::Client *client, int idx) {
 }
 void test_client(result &res) {
     res.t_begin = GetSteadyTimeUs();
-    auto client = net::new_http_client();
+    auto client = net::http::new_http_client();
     DEFER(delete client);
     std::vector<photon::join_handle*> jhs;
     for (auto i = 0; i < FLAGS_threads; ++i) {
@@ -154,15 +153,17 @@ void test_client(result &res) {
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     set_log_output_level(ALOG_INFO);
-    auto ret = photon::thread_init();
+    auto ret = photon::vcpu_init();
     if (ret < 0) return -1;
-    DEFER({ photon::thread_fini(); });
+    DEFER({ photon::vcpu_fini(); });
     ret = photon::fd_events_init();
     if (ret < 0) return -1;
     DEFER({ photon::fd_events_fini(); });
+#ifdef __linux__
     ret = net::et_poller_init();
     if (ret < 0) return -1;
     DEFER(net::et_poller_fini());
+#endif
     ret = net::cURL::init(CURL_GLOBAL_ALL, 0, 0);
     if (ret < 0) return -1;
     DEFER({ photon::thread_sleep(1); net::cURL::fini(); });
