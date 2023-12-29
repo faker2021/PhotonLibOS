@@ -84,11 +84,12 @@ TEST(http_client, get) {
     auto op2 = client->new_operation(Verb::GET, target);
     DEFER(delete op2);
     op2->req.headers.content_length(0);
-    client->call(op2);
+    int ret = client->call(op2);
+    GTEST_ASSERT_EQ(0, ret);
 
     char resp_body_buf[1024];
     EXPECT_EQ(sizeof(socket_buf), op2->resp.resource_size());
-    auto ret = op2->resp.read(resp_body_buf, sizeof(socket_buf));
+    ret = op2->resp.read(resp_body_buf, sizeof(socket_buf));
     EXPECT_EQ(sizeof(socket_buf), ret);
     resp_body_buf[sizeof(socket_buf) - 1] = '\0';
     LOG_DEBUG(resp_body_buf);
@@ -120,6 +121,13 @@ TEST(http_client, get) {
     resp_body_buf[10] = '\0';
     LOG_DEBUG(resp_body_buf);
     EXPECT_EQ(0, strcmp("http_clien", resp_body_buf));
+
+    static const char target_tb[] = "http://www.taobao.com?x";
+    auto op5 = client->new_operation(Verb::GET, target_tb);
+    DEFER(delete op5);
+    op5->req.headers.content_length(0);
+    op5->call();
+    EXPECT_EQ(op5->resp.status_code(), 200);
 }
 
 int body_check_handler(void*, Request &req, Response &resp, std::string_view) {
@@ -186,7 +194,7 @@ TEST(http_client, post) {
     auto op2 = client->new_operation(Verb::POST, target);
     DEFER(delete op2);
     op2->req.headers.content_length(st.st_size);
-    auto writer = [&](Request *req)-> int {
+    auto writer = [&](Request *req)-> ssize_t {
         file->lseek(0, SEEK_SET);
         return req->write_stream(file, st.st_size);
     };
@@ -412,9 +420,9 @@ TEST(http_client, debug) {
     server->setsockopt(SOL_SOCKET, SO_REUSEPORT, 1);
     server->set_handler({nullptr, &chunked_handler_debug});
     auto ret = server->bind(ep.port, ep.addr);
-    if (ret < 0) LOG_ERROR(VALUE(errno));
+    if (ret < 0) LOG_ERROR(ERRNO());
     ret |= server->listen(100);
-    if (ret < 0) LOG_ERROR(VALUE(errno));
+    if (ret < 0) LOG_ERROR(ERRNO());
     EXPECT_EQ(0, ret);
     LOG_INFO("Ready to accept");
     server->start_loop();
@@ -437,13 +445,13 @@ TEST(http_client, debug) {
     memset((void*)buf.data(), '0', std_data_size);
     ret = op_test->resp.read((void*)buf.data(), std_data_size);
     EXPECT_EQ(std_data_size, ret);
-    EXPECT_EQ(true, buf == std_data);
+    EXPECT_TRUE(buf == std_data);
     for (int i = 0; i < buf.size(); i++) {
         if (buf[i] != std_data[i]) {
-            std::cout << i << std::endl;
+            LOG_ERROR("first occurrence of difference at: ", i);
+            break;
         }
     }
-    std::cout << "new" << std::endl;
 }
 int sleep_handler(void*, ISocketStream* sock) {
     photon::thread_sleep(3);
@@ -505,6 +513,48 @@ TEST(http_client, partial_body) {
     EXPECT_EQ(true, buf == "http_clien");
 }
 
+TEST(DISABLED_http_client, ipv6) {  // make sure runing in a ipv6-ready environment
+    auto client = new_http_client();
+    DEFER(delete client);
+    // here is an ipv6-only website
+    auto op = client->new_operation(Verb::GET, "http://test6.ustc.edu.cn");
+    DEFER(delete op);
+    op->call();
+    EXPECT_EQ(200, op->resp.status_code());
+}
+
+TEST(url, url_escape_unescape) {
+    EXPECT_EQ(
+        url_escape("?a=x:b&b=cd&c= feg&d=2/1[+]@alibaba.com&e='!bad';"),
+        "%3Fa%3Dx%3Ab%26b%3Dcd%26c%3D%20feg%26d%3D2%2F1%5B%2B%5D%40alibaba.com%26e%3D%27%21bad%27%3B"
+    );
+    auto x = url_unescape("%3Fa%3Dx%3Ab%26b%3Dcd%26c%3D%20feg%26d%3D2%2F1%5B%2B%5D%40alibaba.com%26e%3D%27%21bad%27%3B");
+    EXPECT_EQ(
+        url_unescape("%3Fa%3Dx%3Ab%26b%3Dcd%26c%3D%20feg%26d%3D2%2F1%5B%2B%5D%40alibaba.com%26e%3D%27%21bad%27%3B"),
+        "?a=x:b&b=cd&c= feg&d=2/1[+]@alibaba.com&e='!bad';"
+    );
+}
+
+TEST(url, path_fix) {
+    static const char url0[] = "http://xxx.com/yyy?a=b&c=d";
+    URL u0(url0);
+    EXPECT_EQ(u0.target(), "/yyy?a=b&c=d");
+    EXPECT_EQ(u0.path(), "/yyy");
+    EXPECT_EQ(u0.query(), "a=b&c=d");
+
+    static const char url1[] = "http://xxx.com";
+    URL u1(url1);
+    EXPECT_EQ(u1.target(), "/");
+    EXPECT_EQ(u1.path(), "/");
+    EXPECT_EQ(u1.query(), "");
+
+    static const char url2[] = "http://xxx.com?a=b";
+    URL u2(url2);
+    EXPECT_EQ(u2.target(), "/?a=b");
+    EXPECT_EQ(u2.path(), "/");
+    EXPECT_EQ(u2.query(), "a=b");
+}
+
 // Only for manual test
 // TEST(http_client, proxy) {
 //     auto client = new_http_client();
@@ -520,15 +570,16 @@ TEST(http_client, partial_body) {
 // }
 
 int main(int argc, char** arg) {
-    photon::vcpu_init();
-    DEFER(photon::vcpu_fini());
-    photon::fd_events_init();
-    DEFER(photon::fd_events_fini());
+    if (photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_NONE))
+        return -1;
+    DEFER(photon::fini());
+#ifdef __linux__
     if (et_poller_init() < 0) {
         LOG_ERROR("et_poller_init failed");
         exit(EAGAIN);
     }
     DEFER(et_poller_fini());
+#endif
     set_log_output_level(ALOG_DEBUG);
     ::testing::InitGoogleTest(&argc, arg);
     LOG_DEBUG("test result:`", RUN_ALL_TESTS());

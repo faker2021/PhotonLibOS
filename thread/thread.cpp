@@ -14,8 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#define protected public
+#include <photon/thread/thread.h>
+#include <photon/thread/timer.h>
+#include "list.h"
+#undef protected
+
 #include <memory.h>
-#include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <cstddef>
@@ -27,11 +32,19 @@ limitations under the License.
 #include <mutex>
 #include <condition_variable>
 
-#define protected public
-#include "thread.h"
-#include "timer.h"
-#include "list.h"
-#undef protected
+#ifdef _WIN64
+#include <processthreadsapi.h>
+#include <stdlib.h>
+inline int posix_memalign(void** memptr, size_t alignment, size_t size) {
+    auto ok = malloc(size);
+    if (!ok)
+        return ENOMEM;
+    *memptr = ok;
+    return 0;
+}
+#else
+#include <sys/mman.h>
+#endif
 
 #include <photon/io/fd-events.h>
 #include <photon/common/timeout.h>
@@ -59,7 +72,19 @@ limitations under the License.
    by target vcpu in resume_thread(), when its runq becomes empty;
 */
 
-#define SCOPED_MEMBER_LOCK(x) SCOPED_LOCK(&(x)->lock, ((bool)x) * 2)
+// Define assembly section header for clang and gcc
+#if defined(__APPLE__)
+#define DEF_ASM_FUNC(name) ".text\n" \
+                           #name": "
+#elif defined(_WIN64)
+#define DEF_ASM_FUNC(name) ".text\n .p2align 4\n" \
+                           ".def "#name"; .scl 3; .type 32; .endef\n" \
+                           #name": "
+#else
+#define DEF_ASM_FUNC(name) ".section .text."#name",\"axG\",@progbits,"#name",comdat\n" \
+                           ".type "#name", @function\n" \
+                           #name": "
+#endif
 
 static constexpr size_t PAGE_SIZE = 1 << 12;
 
@@ -101,20 +126,44 @@ namespace photon
         }
     };
 
+    void* default_photon_thread_stack_alloc(void*, size_t stack_size) {
+        char* ptr = nullptr;
+        int err = posix_memalign((void**)&ptr, PAGE_SIZE, stack_size);
+        if (unlikely(err))
+            LOG_ERROR_RETURN(err, nullptr, "Failed to allocate photon stack! ",
+                             ERRNO(err));
+#if defined(__linux__)
+        madvise(ptr, stack_size, MADV_NOHUGEPAGE);
+#endif
+        return ptr;
+    }
+
+    void default_photon_thread_stack_dealloc(void*, void* ptr, size_t size) {
+#if !defined(_WIN64) && !defined(__aarch64__)
+        madvise(ptr, size, MADV_DONTNEED);
+#endif
+        free(ptr);
+    }
+
+    static Delegate<void*, size_t> photon_thread_alloc(
+        &default_photon_thread_stack_alloc, nullptr);
+    static Delegate<void, void*, size_t> photon_thread_dealloc(
+        &default_photon_thread_stack_dealloc, nullptr);
+
     struct vcpu_t;
     struct thread;
     class Stack
     {
     public:
         template<typename F>
-        void init(void* ptr, F ret2func)
+        void init(void* ptr, F ret2func, thread* th)
         {
             _ptr = ptr;
             assert((uint64_t)_ptr % 16 == 0);
             push(0);
             push(0);
             push(ret2func);
-            push(ptr);   // rbp <= th
+            push(th);   // rbp <== th
         }
         void** pointer_ref()
         {
@@ -218,11 +267,23 @@ namespace photon
         }
 
         void init_main_thread_stack() {
+#ifdef __APPLE__
+            stack_size = pthread_get_stacksize_np(pthread_self());
+            stackful_alloc_top = (char*) pthread_get_stackaddr_np(pthread_self());
+#elif defined(_WIN64)
+            ULONG_PTR stack_low, stack_high;
+            GetCurrentThreadStackLimits(&stack_low, &stack_high);
+            stackful_alloc_top = (char*)stack_low;
+            stack_size = stack_high - stack_low;
+#elif defined(__linux__)
             pthread_attr_t gattr;
             pthread_getattr_np(pthread_self(), &gattr);
             pthread_attr_getstack(&gattr,
                 (void**)&stackful_alloc_top, &stack_size);
             pthread_attr_destroy(&gattr);
+#else
+            static_assert(false, "unsupported platform");
+#endif
         }
 
         void go() {
@@ -242,11 +303,9 @@ namespace photon
         }
         void dispose() {
             assert(state == states::DONE);
-            register auto b = buf; //store in register to prevent from being deleted by madvise
-#ifndef __aarch64__
-            madvise(b, stack_size, MADV_DONTNEED);
-#endif
-            free(b);
+            // `buf` and `stack_size` will always store on register
+            // when calling deallocating.
+            photon_thread_dealloc(buf, stack_size);
         }
     };
 
@@ -585,6 +644,12 @@ namespace photon
         }
     };
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+    static_assert(offsetof(thread, arg)   == 0x40, "...");
+    static_assert(offsetof(thread, start) == 0x48, "...");
+#pragma GCC diagnostic pop
+
     inline void thread::dequeue_ready_atomic(states newstat)
     {
         assert("this is not in runq, and this->lock is locked");
@@ -610,45 +675,42 @@ namespace photon
     }
 
     static void _photon_thread_die(thread* th) asm("_photon_thread_die");
-#ifdef __x86_64__
-    asm(R"(
-.section	.text._photon_switch_context,"axG",@progbits,_photon_switch_context,comdat
-.type	_photon_switch_context, @function
-_photon_switch_context: // (void** rdi_to, void** rsi_from)
+
+#if defined(__x86_64__)
+#if !defined(_WIN64)
+    asm(
+DEF_ASM_FUNC(_photon_switch_context) // (void** rdi_to, void** rsi_from)
+R"(
         push    %rbp
         mov     %rsp, (%rsi)
         mov     (%rdi), %rsp
         pop     %rbp
         ret
+)"
 
-.section	.text._photon_switch_context_defer,"axG",@progbits,_photon_switch_context_defer,comdat
-.type	_photon_switch_context_defer, @function
-_photon_switch_context_defer:   // (void* rdi_arg, void (*rsi_defer)(void*), void** rdx_to, void** rcx_from)
+DEF_ASM_FUNC(_photon_switch_context_defer) // (void* rdi_arg, void (*rsi_defer)(void*), void** rdx_to, void** rcx_from)
+R"(
         push    %rbp
         mov     %rsp, (%rcx)
+)"
 
-.section	.text._photon_switch_context_defer_die,"axG",@progbits,_photon_switch_context_defer_die,comdat
-.type	_photon_switch_context_defer_die, @function
-_photon_switch_context_defer_die:  // (void* rdi_arg, void (*rsi_defer)(void*), void** rdx_to_th)
+DEF_ASM_FUNC(_photon_switch_context_defer_die) // (void* rdi_arg, void (*rsi_defer)(void*), void** rdx_to_th)
+R"(
         mov     (%rdx), %rsp
         pop     %rbp
         jmp     *%rsi
+)"
 
-.section	.text._photon_thread_stub,"axG",@progbits,_photon_thread_stub,comdat
-.type	_photon_thread_stub, @function
-_photon_thread_stub:
+DEF_ASM_FUNC(_photon_thread_stub)
+R"(
         mov     0x40(%rbp), %rdi
         movq    $0, 0x40(%rbp)
         call    *0x48(%rbp)
         mov     %rax, 0x48(%rbp)
         mov     %rbp, %rdi
-        jmp     _photon_thread_die
-    )");
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Winvalid-offsetof"
-    static_assert(offsetof(thread, arg)   == 0x40, "...");
-    static_assert(offsetof(thread, start) == 0x48, "...");
-#pragma GCC diagnostic pop
+        call    _photon_thread_die
+)"
+    );
 
     inline void switch_context(thread* from, thread* to) {
         prepare_switch(from, to);
@@ -677,11 +739,79 @@ _photon_thread_stub:
             : "rax", "rbx", "r8", "r9", "r10", "r11", "r12", "r13", "r14",
               "r15");
     }
+#else // _WIN64
+    asm(
+DEF_ASM_FUNC(_photon_switch_context) // (void** rcx_to, void** rdx_from)
+R"(
+        push    %rbp
+        mov     %rsp, (%rdx)
+        mov     (%rcx), %rsp
+        pop     %rbp
+        ret
+)"
+
+DEF_ASM_FUNC(_photon_switch_context_defer) // (void* rcx_arg, void (*rdx_defer)(void*), void** r8_to, void** r9_from)
+R"(
+        push    %rbp
+        mov     %rsp, (%r9)
+)"
+
+DEF_ASM_FUNC(_photon_switch_context_defer_die) // (void* rcx_arg, void (*rdx_defer)(void*), void** r8_to)
+R"(
+        mov     (%r8), %rsp
+        pop     %rbp
+        jmp     *%rdx
+)"
+
+DEF_ASM_FUNC(_photon_thread_stub)
+R"(
+        mov     0x40(%rbp), %rcx
+        movq    $0, 0x40(%rbp)
+        call    *0x48(%rbp)
+        mov     %rax, 0x48(%rbp)
+        mov     %rbp, %rcx
+        call    _photon_thread_die
+)"
+    );
+
+    inline void switch_context(thread* from, thread* to) {
+        prepare_switch(from, to);
+        auto _t_ = to->stack.pointer_ref();
+        register auto f asm("rdx") = from->stack.pointer_ref();
+        register auto t asm("rcx") = _t_;
+        asm volatile("call _photon_switch_context"  // (to, from)
+                     : "+r"(t), "+r"(f)
+                     :  // "0"(t), "1"(f)
+                     : "rax", "rbx", "rsi", "rdi", "r8", "r9",
+                       "r10", "r11", "r12", "r13", "r14", "r15",
+                       "xmm6",  "xmm7",  "xmm8",  "xmm9",  "xmm10",
+                       "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+    }
+
+    inline void switch_context_defer(thread* from, thread* to,
+                                     void (*defer)(void*), void* arg) {
+        prepare_switch(from, to);
+        auto _t_ = to->stack.pointer_ref();
+        register auto f asm("r9") = from->stack.pointer_ref();
+        register auto t asm("r8") = _t_;
+        register auto a asm("rcx") = arg;
+        register auto d asm("rdx") = defer;
+        asm volatile(
+            "call _photon_switch_context_defer"  // (arg, defer, to, from)
+            : "+r"(t), "+r"(f), "+r"(a), "+r"(d)
+            :  // "0"(t), "1"(f), "2"(a), "3"(d)
+            : "rax", "rbx", "rsi", "rdi", "r10",
+              "r11", "r12", "r13", "r14", "r15",
+              "xmm6",  "xmm7",  "xmm8",  "xmm9",  "xmm10",
+              "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+    }
+#endif // _WIN64
+
 #elif defined(__aarch64__) || defined(__arm64__)
-    asm(R"(
-.section	.text._photon_switch_context,"axG",@progbits,_photon_switch_context,comdat
-.type  _photon_switch_context, %function
-_photon_switch_context: //; (void** x0_from, void** x1_to)
+
+    asm(
+DEF_ASM_FUNC(_photon_switch_context) // (void** x0_from, void** x1_to)
+R"(
         stp x29, x30, [sp, #-16]!
         mov x29, sp
         str x29, [x0]
@@ -689,32 +819,33 @@ _photon_switch_context: //; (void** x0_from, void** x1_to)
         mov sp, x29
         ldp x29, x30, [sp], #16
         ret
+)"
 
-.section	.text._photon_switch_context_defer,"axG",@progbits,_photon_switch_context_defer,comdat
-.type  _photon_switch_context_defer, %function
-_photon_switch_context_defer: //; (void* x0_arg, void (*x1_defer)(void*), void** x2_to, void** x3_from)
+DEF_ASM_FUNC(_photon_switch_context_defer) // (void* x0_arg, void (*x1_defer)(void*), void** x2_to, void** x3_from)
+R"(
         stp x29, x30, [sp, #-16]!
         mov x29, sp
         str x29, [x3]
+)"
 
-.section	.text._photon_switch_context_defer_die,"axG",@progbits,_photon_switch_context_defer_die,comdat
-.type  _photon_switch_context_defer_die, %function
-_photon_switch_context_defer_die: //; (void* x0_arg, void (*x1_defer)(void*), void** x2_to_th)
+DEF_ASM_FUNC(_photon_switch_context_defer_die) // (void* x0_arg, void (*x1_defer)(void*), void** x2_to_th)
+R"(
         ldr x29, [x2]
         mov sp, x29
         ldp x29, x30, [sp], #16
         br x1
+)"
 
-.section	.text._photon_thread_stub,"axG",@progbits,_photon_thread_stub,comdat
-.type  _photon_thread_stub, %function
-_photon_thread_stub:
+DEF_ASM_FUNC(_photon_thread_stub)
+R"(
         ldp x0, x1, [x29, #0x40] //; load arg, start into x0, x1
         str xzr, [x29, #0x40]    //; set arg as 0
         blr x1                   //; start(x0)
         str x0, [x29, #0x48]     //; retval = result
         mov x0, x29              //; move th to x0
         b _photon_thread_die     //; _photon_thread_die(th)
-    )");
+)"
+    );
 
     inline void switch_context(thread* from, thread* to) {
         prepare_switch(from, to);
@@ -751,10 +882,11 @@ _photon_thread_stub:
                        "x17", "x18");
     }
 
-#endif
+#endif  // x86 or arm
 
-    extern "C" void _photon_switch_context_defer_die(void* arg,
-                           uint64_t defer_func_addr, void** to);
+    extern "C" void _photon_switch_context_defer_die(void* arg,uint64_t defer_func_addr, void** to)
+        asm ("_photon_switch_context_defer_die");
+
     inline void thread::die() {
         deallocate_tls(&tls);
         // if CURRENT is idle stub and during vcpu_fini
@@ -786,36 +918,32 @@ _photon_thread_stub:
         th->die();
     }
 
-    extern "C" void _photon_thread_stub();
+    extern "C" void _photon_thread_stub() asm ("_photon_thread_stub");
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
-    thread* thread_create(thread_entry start, void* arg, uint64_t stack_size) {
+    thread* thread_create(thread_entry start, void* arg,
+                uint64_t stack_size, uint16_t reserved_space) {
         RunQ rq;
         if (unlikely(!rq.current))
             LOG_ERROR_RETURN(ENOSYS, nullptr, "Photon not initialized in this vCPU (OS thread)");
         size_t randomizer = (rand() % 32) * (1024 + 8);
         stack_size = align_up(randomizer + stack_size + sizeof(thread), PAGE_SIZE);
-        char* ptr = nullptr;
-        int err = posix_memalign((void**)&ptr, PAGE_SIZE, stack_size);
-        if (unlikely(err))
-            LOG_ERROR_RETURN(err, nullptr, "Failed to allocate photon stack! ", ERRNO(err));
+        char* ptr = (char*)photon_thread_alloc(stack_size);
         auto p = ptr + stack_size - sizeof(thread) - randomizer;
         (uint64_t&)p &= ~63;
         auto th = new (p) thread;
         th->buf = ptr;
         th->stackful_alloc_top = ptr;
         th->start = start;
-        th->arg = arg;
         th->stack_size = stack_size;
-        th->stack.init(p, &_photon_thread_stub);
+        th->arg = arg;
+        auto sp = align_down((uint64_t)p - reserved_space, 64);
+        th->stack.init((void*)sp, &_photon_thread_stub, th);
         AtomicRunQ arq(rq);
         th->vcpu = arq.vcpu;
         arq.vcpu->nthreads++;
         arq.insert_tail(th);
         return th;
     }
-#pragma GCC diagnostic pop
 
 #if defined(__x86_64__) && defined(__linux__) && defined(ENABLE_MIMIC_VDSO)
 #include <sys/auxv.h>
@@ -934,8 +1062,11 @@ _photon_thread_stub:
         return (hi << 12) | (low >> 20);
     #elif defined(__aarch64__)
         uint64_t val;
+        uint64_t freq;
         asm volatile("mrs %0, cntvct_el0" : "=r" (val));
-        return (uint32_t)(val >> 20);
+        asm volatile("mrs %0, cntfrq_el0" : "=r" (freq));
+        // cycles * microsec_per_sec / frequency = microsec
+        return (val << 10) / freq;
     #endif
     }
     static uint32_t last_tsc = 0;
@@ -1066,7 +1197,8 @@ _photon_thread_stub:
     __attribute__((always_inline)) inline
     Switch prepare_usleep(uint64_t useconds, thread_list* waitq, RunQ rq = {})
     {
-        SCOPED_MEMBER_LOCK(waitq);
+        spinlock* waitq_lock = waitq ? &waitq->lock : nullptr;
+        SCOPED_LOCK(waitq_lock, ((bool) waitq) * 2);
         SCOPED_LOCK(rq.current->lock);
         assert(!AtomicRunQ(rq).single());
         auto sw = AtomicRunQ(rq).remove_current(states::SLEEPING);
@@ -1192,7 +1324,7 @@ _photon_thread_stub:
     }
 
     static void do_stack_pages_gc(void* arg) {
-#ifndef __aarch64__
+#if !defined(_WIN64) && !defined(__aarch64__)
         auto th = (thread*)arg;
         assert(th->vcpu == CURRENT->vcpu);
         auto buf = th->buf;
@@ -1412,10 +1544,13 @@ _photon_thread_stub:
         auto splock = (spinlock*)s_;
         splock->unlock();
     }
-    int mutex::lock(uint64_t timeout)
-    {
-        if (try_lock() == 0)
-            return 0;
+    int mutex::lock(uint64_t timeout) {
+        if (try_lock() == 0) return 0;
+        for (auto re = retries; re; --re) {
+            thread_yield();
+            if (try_lock() == 0)
+                return 0;
+        }
         splock.lock();
         if (try_lock() == 0) {
             splock.unlock();
@@ -1436,7 +1571,7 @@ _photon_thread_stub:
     {
         thread* ptr = nullptr;
         bool ret = owner.compare_exchange_strong(ptr, CURRENT,
-            std::memory_order_release, std::memory_order_relaxed);
+            std::memory_order_acq_rel, std::memory_order_relaxed);
         return (int)ret - 1;
     }
     inline void do_mutex_unlock(mutex* m)
@@ -1457,9 +1592,12 @@ _photon_thread_stub:
     void mutex::unlock()
     {
         auto th = owner.load();
-        if (!th)
+        if (unlikely(!th)) {
+            if (unlikely(!CURRENT))
+                return;
             LOG_ERROR_RETURN(EINVAL, , "the mutex was not locked");
-        if (th != CURRENT)
+        }
+        if (unlikely(th != CURRENT))
             LOG_ERROR_RETURN(EINVAL, , "the mutex was not locked by current thread");
         do_mutex_unlock(this);
     }
@@ -1584,7 +1722,7 @@ _photon_thread_stub:
         mark &= ~(RLOCK | WLOCK);
         mark |= mode;
         CURRENT->rwlock_mark = mark;
-        uint64_t op = (mode == RLOCK) ? (1UL << 63) : -1UL;
+        uint64_t op = (mode == RLOCK) ? (1ULL << 63) : -1ULL;
         if (cvar.q.th || (op & state)) {
             do {
                 int ret = cvar.wait(lock, timeout);
@@ -1772,5 +1910,12 @@ _photon_thread_stub:
 
     void stackful_free(void* ptr) {
         CURRENT->stackful_free(ptr);
+    }
+
+    void set_photon_thread_stack_allocator(
+        Delegate<void *, size_t> _photon_thread_alloc,
+        Delegate<void, void *, size_t> _photon_thread_dealloc) {
+        photon_thread_alloc = _photon_thread_alloc;
+        photon_thread_dealloc = _photon_thread_dealloc;
     }
 }

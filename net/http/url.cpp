@@ -22,7 +22,23 @@ namespace photon {
 namespace net {
 namespace http {
 
+void URL::fix_target() {
+    auto t = (m_url | m_target);
+    if (m_target.size() == 0 || t.front() != '/') {
+        m_tmp_target = (char*)malloc(m_target.size() + 1);
+        m_tmp_target[0] = '/';
+        strncpy(m_tmp_target+1, t.data(), t.size());
+        m_target = rstring_view16(0, m_target.size()+1);
+        m_path = rstring_view16(0, m_path.size()+1);
+    }
+}
+
 void URL::from_string(std::string_view url) {
+    DEFER(fix_target(););
+    if (m_tmp_target) {
+        free((void*)m_tmp_target);
+        m_tmp_target = nullptr;
+    }
     m_url = url.begin();
     size_t pos = 0;
     LOG_DEBUG(VALUE(url));
@@ -34,7 +50,7 @@ void URL::from_string(std::string_view url) {
         pos += p + 3;
         url.remove_prefix(p + 3);
     }
-    p = url.find_first_of(":/");
+    p = url.find_first_of(":/?");
     if (p == url.npos) p = url.size();
     m_host = rstring_view16(pos, p);
     m_host_port = m_host;
@@ -77,6 +93,47 @@ void URL::from_string(std::string_view url) {
     m_target = rstring_view16(pos, url.size());
     pos += p+1;
     m_query = rstring_view16(pos, url.size() - (p + 1));
+}
+
+static bool isunreserved(char c) {
+    if (c >= '0' && c <= '9') return true;
+    if (c >= 'A' && c <= 'Z') return true;
+    if (c >= 'a' && c <= 'z') return true;
+    if (c == '-' || c == '.' || c == '_' || c == '~') return true;
+    return false;
+}
+
+std::string url_escape(std::string_view url) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string ret;
+    ret.reserve(url.size() * 2);
+
+    for (auto c : url) {
+        if (isunreserved(c)) {
+            ret.push_back(c);
+        } else {
+            ret += '%';
+            ret += hex[c >> 4];
+            ret += hex[c & 0xf];
+        }
+    }
+    return ret;
+}
+
+std::string url_unescape(std::string_view url) {
+    std::string ret;
+    ret.reserve(url.size());
+    for (unsigned int i = 0; i < url.size(); i++) {
+        if (url[i] == '%') {
+            auto c = estring_view(url.substr(i + 1, 2)).hex_to_uint64();
+            ret += static_cast<char>(c);
+            i += 2;
+        } else if (url[i] == '+')
+            ret += ' ';
+        else
+            ret += url[i];
+    }
+    return ret;
 }
 
 } // namespace http

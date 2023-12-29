@@ -159,7 +159,7 @@ TEST(headers, resp_header) {
     do {
         auto ret = rand_header.receive_bytes(&stream);
         if (stream.done()) EXPECT_EQ(0, ret); else
-            EXPECT_EQ(1, ret);
+            EXPECT_EQ(2, ret);
     } while (!stream.done());
     EXPECT_EQ(true, rand_header.version() == "1.1");
     EXPECT_EQ(200, rand_header.status_code());
@@ -179,16 +179,17 @@ TEST(headers, resp_header) {
     do {
         auto ret = exceed_header.receive_bytes(&exceed_stream);
         if (exceed_stream.done()) EXPECT_EQ(-1, ret); else
-            EXPECT_EQ(1, ret);
+            EXPECT_EQ(2, ret);
     } while (!exceed_stream.done());
 }
 TEST(headers, url) {
-    RequestHeadersStored<> headers(Verb::UNKNOWN, "https://domain.com/dir1/dir2/file?key1=value1&key2=value2");
-    LOG_DEBUG(VALUE(headers.target()));
-    LOG_DEBUG(VALUE(headers.host()));
-    LOG_DEBUG(VALUE(headers.secure()));
-    LOG_DEBUG(VALUE(headers.query()));
-    LOG_DEBUG(VALUE(headers.port()));
+    RequestHeadersStored<> headers(Verb::UNKNOWN, "https://domain.com:8888/dir1/dir2/file?key1=value1&key2=value2");
+    EXPECT_EQ(true, headers.target() =="/dir1/dir2/file?key1=value1&key2=value2");
+    EXPECT_EQ(true, headers.host() == "domain.com:8888");
+    EXPECT_EQ(headers.port(), 8888);
+    EXPECT_EQ(true, headers.host_no_port() == "domain.com");
+    EXPECT_EQ(headers.secure(), 1);
+    EXPECT_EQ(true, headers.query() == "key1=value1&key2=value2");
     RequestHeadersStored<> new_headers(Verb::UNKNOWN, "");
     if (headers.secure())
         new_headers.headers.insert("Referer", http_url_scheme);
@@ -198,6 +199,7 @@ TEST(headers, url) {
     new_headers.headers.value_append(headers.target());
     auto Referer_value = new_headers.headers["Referer"];
     LOG_DEBUG(VALUE(Referer_value));
+    EXPECT_EQ(true, Referer_value == "http://domain.com:8888/dir1/dir2/file?key1=value1&key2=value2");
 }
 
 TEST(ReqHeaders, redirect) {
@@ -233,10 +235,9 @@ TEST(debug, debug) {
 }
 
 int main(int argc, char** arg) {
-    photon::vcpu_init();
-    DEFER(photon::vcpu_fini());
-    photon::fd_events_init();
-    DEFER(photon::fd_events_fini());
+    if (photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_NONE))
+        return -1;
+    DEFER(photon::fini());
 #ifdef __linux
     if (net::et_poller_init() < 0) {
         LOG_ERROR("net::et_poller_init failed");

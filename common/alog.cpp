@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#ifdef _WIN64
+#define _POSIX_C_SOURCE 1
+#endif
 #include "alog.h"
 #include "lockfree_queue.h"
 #include "photon/thread/thread.h"
@@ -200,6 +203,7 @@ void LogFormatter::put_integer_dec(ALogBuffer& buf, ALogInteger x)
     }
 }
 
+__attribute__((constructor)) static void __initial_timezone() { tzset(); }
 static time_t dayid = 0;
 static struct tm alog_time = {0};
 struct tm* alog_update_time(time_t now)
@@ -226,7 +230,7 @@ struct tm* alog_update_time(time_t now)
 
 static struct tm* alog_update_time()
 {
-    return alog_update_time(time(0) + 8 * 60 * 60);
+    return alog_update_time(time(0) - timezone);
 }
 
 class LogOutputFile final : public BaseLogOutput {
@@ -250,7 +254,11 @@ public:
         if (log_file_fd < 0) return;
         uint64_t length = end - begin;
         iovec iov{(void*)begin, length};
+#ifndef _WIN64
         ::writev(log_file_fd, &iov, 1); // writev() is atomic, whereas write() is not
+#else
+        ::write(log_file_fd, iov.iov_base, iov.iov_len);
+#endif
         throttle_block();
         if (log_file_name && log_file_size_limit) {
             log_file_size += length;

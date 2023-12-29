@@ -58,10 +58,8 @@ struct __remove_first_type_in_tuple<std::tuple<T, Ts...>> {
 // functor
 template <class F>
 struct callable {
-private:
     using call_type = callable<decltype(&F::operator())>;
 
-public:
     using return_type = typename call_type::return_type;
 
     using arguments = typename __remove_first_type_in_tuple<
@@ -74,27 +72,27 @@ struct callable<F&> : public callable<F> {};
 template <class F>
 struct callable<F&&> : public callable<F> {};
 
-#if cplusplus__ < 201700
+// #if __cplusplus < 201700
 template <typename F, typename Tuple, std::size_t... I>
-constexpr static decltype(auto) apply_impl(F&& f, Tuple&& t,
+constexpr inline decltype(auto) apply_impl(F&& f, Tuple&& t,
                                            std::index_sequence<I...>) {
-    return f(std::forward<typename std::tuple_element<
-                 I, typename callable<F>::arguments>::type>(std::get<I>(t))...);
+    using Args = typename callable<F>::arguments;
+    return f(std::forward<typename std::tuple_element<I, Args>::type>(
+             std::get<I>(t))...);
 }
 
 // Implementation of a simplified std::apply from C++17
 template <typename F, typename Tuple>
-constexpr static decltype(auto) apply(F&& f, Tuple&& t) {
+constexpr inline decltype(auto) apply(F&& f, Tuple&& t) {
     return apply_impl(
         std::forward<F>(f), std::forward<Tuple>(t),
         std::make_index_sequence<
             std::tuple_size<std::remove_reference_t<Tuple>>::value>{});
 }
 
-#else
-template <typename F, typename Tuple>
-using template std::apply<F, Tuple>;
-#endif
+// #else
+// using std::apply;
+// #endif
 
 template <typename P, size_t I, typename... Ts>
 struct do_enumerate;

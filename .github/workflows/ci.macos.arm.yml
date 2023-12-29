@@ -1,0 +1,35 @@
+name: macOS ARM
+
+on:
+  push:
+    branches: [ "main", "release/*" ]
+  pull_request:
+    branches: [ "main", "release/*" ]
+
+jobs:
+  macOS-clang-debug:
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+#      - uses: szenius/set-timezone@v1.2
+#        with:
+#          timezoneLinux: "Asia/Shanghai"
+#          timezoneMacos: "Asia/Shanghai"
+#          timezoneWindows: "China Standard Time"
+
+      - uses: actions/checkout@v3
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          brew install cmake openssl gflags googletest gsasl
+
+      - name: Build
+        run: |
+          cmake -B ${{github.workspace}}/build -D PHOTON_BUILD_TESTING=ON -D CMAKE_BUILD_TYPE=Debug \
+            -D PHOTON_ENABLE_SASL=ON -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3
+          cmake --build ${{github.workspace}}/build -j -- VERBOSE=1
+
+      - name: Test
+        working-directory: ${{github.workspace}}/build
+        run: ctest --timeout 3600 -V

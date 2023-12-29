@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #include "signal.h"
+#include <cstdlib>
 #include <unistd.h>
 #include <pthread.h>
 #ifdef __APPLE__
@@ -26,16 +27,19 @@ limitations under the License.
 #include "fd-events.h"
 #include "../common/event-loop.h"
 #include "../common/alog.h"
+#include "reset_handle.h"
 
 namespace photon
 {
     static constexpr int SIGNAL_MAX = 64;
 
     static int sgfd = -1;
+    static vcpu_base* signal_vcpu = nullptr;
     static void* sighandlers[SIGNAL_MAX + 1];
     static sigset_t infoset = {0};
     static sigset_t sigset = {-1U};
     static EventLoop* eloop = nullptr;
+    static photon::mutex init_mutex;
 #ifdef __APPLE__
     struct kevent _events[32];
     struct timespec tm {0, 0};
@@ -225,30 +229,55 @@ namespace photon
 #endif
     }
 
-    // should be invoked in child process after forked, to clear signal mask
-    static void fork_hook_child(void)
-    {
-        LOG_DEBUG("Fork hook");
-        sigset_t sigset0;       // can NOT use photon::clear_signal_mask(),
-        sigemptyset(&sigset0);  // as memory may be shared with parent, when vfork()ed
-        sigprocmask(SIG_SETMASK, &sigset0, nullptr);
-    }
+    class SignalResetHandle : public ResetHandle {
+        int reset() override {
+            if (sgfd < 0)
+                return 0;
+            LOG_INFO("reset signalfd by reset handle");
+            sigset_t sigset0;       // can NOT use photon::clear_signal_mask(),
+            sigemptyset(&sigset0);  // as memory may be shared with parent, when vfork()ed
+            sigprocmask(SIG_SETMASK, &sigset0, nullptr);
+            // reset sgfd
+            memset(sighandlers, 0, sizeof(sighandlers));
+#ifdef __APPLE__
+            sgfd = kqueue();        // kqueue fd is not inherited from the parent process
+#else
+            close(sgfd);
+            sigfillset(&sigset);
+            sgfd = signalfd(-1, &sigset, SFD_CLOEXEC | SFD_NONBLOCK);
+#endif
+            if (sgfd == -1) {
+                LOG_ERROR("failed to create signalfd() or kqueue()");
+                exit(1);
+            }
+            // interrupt event loop by ETIMEDOUT to replace sgfd
+            if (eloop)
+                thread_interrupt(eloop->loop_thread(), ETIMEDOUT);
+
+            return 0;
+        }
+    };
+    static SignalResetHandle *reset_handler = nullptr;
 
     int sync_signal_init()
     {
-        if (sgfd != -1)
-            LOG_ERROR_RETURN(EALREADY, -1, "already inited");
+        photon::scoped_lock lock(init_mutex);
+        if (sgfd >= 0)
+            return 0;
+        memset(sighandlers, 0, sizeof(sighandlers));
 #ifdef __APPLE__
         sgfd = kqueue();
 #else
+        sigfillset(&sigset);
         sgfd = signalfd(-1, &sigset, SFD_CLOEXEC | SFD_NONBLOCK);
 #endif
         if (sgfd == -1)
-            LOG_ERRNO_RETURN(0, -1, "failed to create signalfd()");
+            LOG_ERRNO_RETURN(0, -1, "failed to create signalfd() or kqueue()");
 
         eloop = new_event_loop(
             {nullptr, &wait_for_signal},
             {nullptr, &fire_signal});
+        signal_vcpu = photon::get_vcpu();
         if (!eloop)
         {
             close(sgfd);
@@ -257,17 +286,26 @@ namespace photon
         }
         eloop->async_run();
         thread_yield(); // give a chance let eloop to execute do_wait
-        pthread_atfork(nullptr, nullptr, &fork_hook_child);
+        if (reset_handler == nullptr) {
+            reset_handler = new SignalResetHandle();
+        }
+        LOG_INFO("signalfd initialized");
         return clear_signal_mask();
     }
 
     int sync_signal_fini()
     {
-        if (sgfd == -1)
-            LOG_ERROR_RETURN(EALREADY, -1, "already finited");
-
-        eloop->stop();
-        close(sgfd);
+        {
+            photon::scoped_lock lock(init_mutex);
+            if (get_vcpu() != signal_vcpu) {
+                return 0;
+            }
+            if (sgfd < 0)
+                return 0;
+            eloop->stop();
+            close(sgfd);
+            sgfd = -1;
+        }
         delete eloop;
 #ifdef __APPLE__
         // Kqueue can detect singals with EVFILT_SIGNAL but cannot consume them, so we need clear
@@ -285,6 +323,8 @@ namespace photon
             }
         }
 #endif
+        safe_delete(reset_handler);
+        LOG_INFO("signalfd finished");
         return clear_signal_mask();
     }
 }

@@ -57,7 +57,7 @@ public:
     void reset(void* buf, uint16_t buf_capacity, bool buf_ownership = false,
                 ISocketStream* s = nullptr, bool stream_ownership = false) {
         reset(s, stream_ownership);
-        if (m_buf_ownership && m_buf) {
+        if (m_buf_ownership) {
             free(m_buf);
         }
         m_buf = (char*)buf;
@@ -119,14 +119,18 @@ protected:
     // return negative if an error occured
     int receive_header(uint64_t timeout = -1UL);
     int send_header(net::ISocketStream* stream = nullptr);
+    // return 0 if whole header recvd
+    // return 1 if end of stream
+    // return 2 if partial header recvd
+    // return a negative number if an error occured
     int receive_bytes(net::ISocketStream* stream);
     // return 0 if "\r\n\r\n" is recvd
-    // return 1 if "\r\n\r\n" is not recvd
+    // return 2 if "\r\n\r\n" is not recvd
     // return a negative number if an error occured
     int append_bytes(uint16_t size);
 
     int skip_remain();
-    int close() { return 0; }
+    int close() override { return 0; }
 
     std::string_view partial_body() const {
         return std::string_view{m_buf, m_buf_size} | m_body;
@@ -172,7 +176,17 @@ public:
     uint16_t port() const {
         return m_port;
     }
+    std::string_view host_no_port() const {
+        // only contains host, without port
+        auto tmp = headers["Host"];
+        auto pos = tmp.find(":");
+        if (pos == std::string_view::npos) {
+            return tmp;
+        }
+        return tmp.substr(0, pos);
+    }
     std::string_view host() const {
+        // the original "Host" in header
         return headers["Host"];
     }
     std::string_view abs_path() const {

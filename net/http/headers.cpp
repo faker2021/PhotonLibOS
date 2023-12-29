@@ -64,11 +64,6 @@ HeadersBase::iterator HeadersBase::find(std::string_view key) const {
     return {this, (uint16_t)(it - kv_begin())};
 }
 
-void buf_append(char*& ptr, std::string_view sv) {
-    memcpy(ptr, sv.data(), sv.size());
-    ptr += sv.size();
-}
-
 void buf_append(char*& ptr, uint64_t x) {
     auto begin = ptr;
     do {
@@ -170,7 +165,8 @@ int HeadersBase::parse() {
     Parser p({m_buf, m_buf_size});
     while(p[0] != '\r') {
         auto k = p.extract_until_char(':');
-        p.skip_string(": ");
+        p.skip_chars(':');
+        p.skip_chars(' ', true);
         auto v = p.extract_until_char('\r');
         p.skip_string("\r\n");
         if (kv_add({k, v}) == nullptr)
@@ -182,7 +178,7 @@ int HeadersBase::parse() {
 
 std::pair<ssize_t, ssize_t> Headers::range() const {
     auto found = find("Range");
-    if (found == end()) return {-1, -1};
+    if (found == end()) return {0, -1};
     auto range = found.second();
     auto eq_pos = range.find("=");
     auto dash_pos = range.find("-");

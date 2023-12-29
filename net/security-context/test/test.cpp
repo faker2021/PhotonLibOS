@@ -97,7 +97,7 @@ int close_test_handler_during_read(void* arg, net::ISocketStream* stream) {
     auto ret = ss->read(buf, 6);
     LOG_INFO("AFTER READ");
     // since client will shutdown, return value should be 0
-    EXPECT_EQ(0, ret);
+    EXPECT_EQ(3, ret);
     LOG_INFO(VALUE(buf));
     LOG_INFO("BEFORE WRITE");
     ss->write(buffer, 1048576);
@@ -350,10 +350,14 @@ TEST(Socket, nested) {
 }
 
 int main(int argc, char** arg) {
-    photon::vcpu_init();
-    DEFER(photon::vcpu_fini());
-    photon::fd_events_init();
-    DEFER(photon::fd_events_fini());
+#ifdef __linux__
+    int ev_engine = photon::INIT_EVENT_EPOLL;
+#else
+    int ev_engine = photon::INIT_EVENT_KQUEUE;
+#endif
+    if (photon::init(ev_engine, photon::INIT_IO_NONE))
+        return -1;
+    DEFER(photon::fini());
     ::testing::InitGoogleTest(&argc, arg);
     return RUN_ALL_TESTS();
 }

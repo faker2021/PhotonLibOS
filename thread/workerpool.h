@@ -19,6 +19,7 @@ limitations under the License.
 #include <photon/common/callback.h>
 #include <photon/common/tuple-assistance.h>
 #include <photon/thread/thread.h>
+#include <photon/thread/awaiter.h>
 
 #include <memory>
 #include <utility>
@@ -69,15 +70,15 @@ public:
      * f will not being collected.
      * @param args Arguments calling `f`
      */
-    template <typename F, typename... Args>
+    template <typename Context = PhotonContext, typename F, typename... Args>
     void call(F&& f, Args&&... args) {
         auto task = [&] { f(std::forward<Args>(args)...); };
-        do_call(task);
+        do_call<Context>(task);
     }
 
-    template <typename F>
+    template <typename Context = PhotonContext, typename F>
     void call(F&& f) {  // in case f is a lambda
-        do_call(f);
+        do_call<Context>(f);
     }
 
     /**
@@ -99,7 +100,7 @@ public:
      *
      * @param th Photon thread that goint to migrate
      * @param index Which vcpu in pool to migrate to. if index is not in range
-     * [0, vcpu_num), it will choose random one in pool.
+     * [0, vcpu_num), it will choose the next one in pool (round-robin).
      * @return int 0 for success, and <0 means failed to migrate.
      */
     int thread_migrate(photon::thread* th = CURRENT, size_t index = -1UL) {
@@ -111,6 +112,7 @@ protected:
     std::unique_ptr<impl> pImpl;
     // send delegate to run at a workerthread,
     // Caller should keep callable object and resources alive
+    template<typename Context>
     void do_call(Delegate<void> call);
     void enqueue(Delegate<void> call);
     photon::vcpu_base* get_vcpu_in_pool(size_t index);

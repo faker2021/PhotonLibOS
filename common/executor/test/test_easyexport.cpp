@@ -24,7 +24,7 @@ limitations under the License.
 #include <photon/io/fd-events.h>
 #include <photon/thread/thread.h>
 #include <photon/common/executor/executor.h>
-#include <photon/common/executor/easylock.h>
+#include <photon/common/executor/easyawaiter.h>
 
 using namespace photon;
 
@@ -84,8 +84,9 @@ TEST(easy_performer, test) {
     easy_atomic_set(count, 10000);
 
     std::thread([]() {
-        photon::vcpu_init();
-        photon::fd_events_init();
+        if (photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_NONE))
+            return -1;
+        DEFER(photon::fini());
         fs::exportfs_init();
 
         g_fs = fs::export_as_easy_sync_fs(
@@ -97,7 +98,7 @@ TEST(easy_performer, test) {
         }
 
         fs::exportfs_fini();
-        photon::fd_events_fini();
+        return 0;
     }).detach();
 
     EasyCoroutinePool ecp;

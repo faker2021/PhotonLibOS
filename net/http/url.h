@@ -48,9 +48,13 @@ protected:
     rstring_view16 m_fragment;
     uint16_t m_port = 0;
     bool m_secure;
+    char *m_tmp_target = nullptr;
 public:
     URL() = default;
     URL(std::string_view url) { from_string(url); }
+    ~URL() {
+        free((void*)m_tmp_target);
+    }
 
     std::string to_string() {
         return m_url;
@@ -61,18 +65,23 @@ public:
     }
 
     void from_string(std::string_view url);
+    void fix_target();
     std::string_view query() const { return m_url | m_query; }
 
     std::string_view path() const {
-        return m_url | m_path;
+        if (m_tmp_target != nullptr)
+            return (m_tmp_target | m_path);
+        return (m_url | m_path);
     }
 
     std::string_view target() const {
-        return m_target.size() == 0 ?
-            std::string_view("/") : (m_url | m_target);
+        if (m_tmp_target != nullptr)
+            return (m_tmp_target | m_target);
+        return (m_url | m_target);
     }
 
     std::string_view host() const { return m_url | m_host; }
+    std::string_view host_no_port() const { return host(); }
     std::string_view host_port() const { return m_url | m_host_port;}
     uint16_t port() const { return m_port; }
     bool secure() const { return m_secure; }
@@ -99,6 +108,9 @@ inline bool need_optional_port(const URL& u) {
     if (!u.secure() && u.port() != 80) return true;
     return false;
 }
+
+std::string url_escape(std::string_view url);
+std::string url_unescape(std::string_view url);
 
 } // namespace http
 } // namespace net

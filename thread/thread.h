@@ -32,8 +32,6 @@ namespace photon
     int wait_all();
     int timestamp_updater_init();
     int timestamp_updater_fini();
-    void* stackful_malloc(size_t size);
-    void stackful_free(void* ptr);
 
 
     struct thread;
@@ -43,17 +41,24 @@ namespace photon
     enum states
     {
         READY = 0,      // Ready to run
-        RUNNING = 1,    // Only one thread could be running at a time
+        RUNNING = 1,    // Only one thread for each VCPU could be running at a time
         SLEEPING = 2,   // Sleeping and waiting for events
         DONE = 4,       // Have finished the whole life-cycle
         STANDBY = 8,    // Internally used by across-vcpu scheduling
     };
 
+    // Create a new thread with the entry point `start(arg)` and `stack_size`.
+    // Reserved space can be used to passed large arguments to the new thread.
     typedef void* (*thread_entry)(void*);
-    typedef void (*defer_func)(void*);
     const uint64_t DEFAULT_STACK_SIZE = 8 * 1024 * 1024;
     thread* thread_create(thread_entry start, void* arg,
-                          uint64_t stack_size = DEFAULT_STACK_SIZE);
+        uint64_t stack_size = DEFAULT_STACK_SIZE, uint16_t reserved_space = 0);
+
+    // get the address of reserved space, which is right below the thread struct.
+    template<typename T = void> inline
+    T* thread_reserved_space(thread* th, uint64_t reserved_size = sizeof(T)) {
+        return (T*)((char*)th - reserved_size);
+    }
 
     // Threads are join-able *only* through their join_handle.
     // Once join is enabled, the thread will remain existing until being joined.
@@ -72,8 +77,10 @@ namespace photon
     // control to other threads, resuming possible sleepers.
     // Return 0 if timeout, return -1 if interrupted, and errno is set by the interrupt invoker.
     int thread_usleep(uint64_t useconds);
+
     // thread_usleep_defer sets a callback, and will execute callback in another photon thread
     // after this photon thread fall in sleep. The defer function should NEVER fall into sleep!
+    typedef void (*defer_func)(void*);
     int thread_usleep_defer(uint64_t useconds, defer_func defer, void* defer_arg=nullptr);
     inline int thread_sleep(uint64_t seconds)
     {
@@ -219,8 +226,9 @@ namespace photon
     class mutex : protected waitq
     {
     public:
-        int lock(uint64_t timeout = -1);        // threads are guaranteed to get the lock
-        int try_lock();                         // in FIFO order, when there's contention
+        mutex(uint16_t max_retries = 100) : retries(max_retries) { }
+        int lock(uint64_t timeout = -1);
+        int try_lock();
         void unlock();
         ~mutex()
         {
@@ -229,11 +237,19 @@ namespace photon
 
     protected:
         std::atomic<thread*> owner{nullptr};
+        uint16_t retries;
         spinlock splock;
+    };
+
+    class seq_mutex : protected mutex {
+    public:
+        // threads are guaranteed to get the lock in sequental order (FIFO)
+        seq_mutex() : mutex(0) { }
     };
 
     class recursive_mutex : protected mutex {
     public:
+        using mutex::mutex;
         int lock(uint64_t timeout = -1);
         int try_lock();
         void unlock();
@@ -241,12 +257,10 @@ namespace photon
         int32_t recursive_count = 0;
     };
 
-    template<typename M0>
+    template <typename M>
     class locker
     {
     public:
-        using M1 = typename std::decay<M0>::type;
-        using M  = typename std::remove_pointer<M1>::type;
 
         // do lock() if `do_lock` > 0, and lock() can NOT fail if `do_lock` > 1
         explicit locker(M* mutex, uint64_t do_lock = 2) : m_mutex(mutex)
@@ -311,8 +325,14 @@ namespace photon
 
     #define _TOKEN_CONCAT(a, b) a ## b
     #define _TOKEN_CONCAT_(a, b) _TOKEN_CONCAT(a, b)
-    #define SCOPED_LOCK(x, ...) photon::locker<decltype(x)> \
+
+#if __cpp_deduction_guides >= 201606
+    #define SCOPED_LOCK(x, ...) photon::locker \
         _TOKEN_CONCAT_(__locker__, __LINE__) (x, ##__VA_ARGS__)
+#else
+    #define SCOPED_LOCK(x, ...) photon::locker<std::remove_pointer_t<std::decay_t<decltype(x)>>> \
+        _TOKEN_CONCAT_(__locker__, __LINE__) (x, ##__VA_ARGS__)
+#endif
 
     class condition_variable : protected waitq
     {
@@ -348,6 +368,7 @@ namespace photon
         int wait(uint64_t count, uint64_t timeout = -1);
         int signal(uint64_t count)
         {
+            if (count == 0) return 0;
             SCOPED_LOCK(splock);
             m_count.fetch_add(count);
             resume_one();
@@ -418,6 +439,23 @@ namespace photon
 
     bool is_master_event_engine_default();
     void reset_master_event_engine_default();
+
+    // alloc space on rear end of current thread stack,
+    // helps allocating when using hybrid C++20 style coroutine
+    void* stackful_malloc(size_t size);
+    void stackful_free(void* ptr);
+
+    // Set photon allocator/deallocator for photon thread stack
+    // this is a hook for thread allocation, both alloc and dealloc
+    // helps user to do more works like mark GC while allocating
+    void* default_photon_thread_stack_alloc(void*, size_t stack_size);
+    void default_photon_thread_stack_dealloc(void*, void* stack_ptr,
+                                             size_t stack_size);
+    void set_photon_thread_stack_allocator(
+        Delegate<void*, size_t> photon_thread_alloc = {
+            &default_photon_thread_stack_alloc, nullptr},
+        Delegate<void, void*, size_t> photon_thread_dealloc = {
+            &default_photon_thread_stack_dealloc, nullptr});
 
     // Saturating addition, primarily for timeout caculation
     __attribute__((always_inline)) inline uint64_t sat_add(uint64_t x,

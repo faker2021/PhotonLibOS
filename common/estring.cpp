@@ -55,33 +55,42 @@ size_t estring_view::find_last_not_of(const charset& set) const
 
 bool estring_view::to_uint64_check(uint64_t* v) const
 {
-    v ? (*v = 0) : 0;
-    for (unsigned char c : *this) {
-        if (c > '9' || c < '0')
-            return false;
-        v ? (*v = *v * 10 + (c - '0')) : 0;
+    if (this->empty()) return false;
+    uint64_t val = (*this)[0] - '0';
+    if (val > 9) return false;
+    for (unsigned char c : this->substr(1)) {
+        c -= '0';
+        if (c > 9) break;
+        val = val * 10 + c;
     }
+    if (v) *v = val;
     return true;
 }
 
-uint64_t estring_view::hex_to_uint64() const
-{
-    uint64_t ret = 0;
-    for (unsigned char c : *this) {
-        if (c >= '0' && c <= '9') {
-            ret = ret * 16 + (c - '0');
-        } else if (c >= 'A' && c <= 'F') {
-            ret = ret * 16 + (c - 'A' + 10);
-        } else if (c >= 'a' && c <= 'f') {
-            ret = ret * 16 + (c - 'a' + 10);
-        } else {
-            return ret;
-        }
-    }
-    return ret;
+inline char hex_char_to_digit(char c) {
+    unsigned char cc = c - '0';
+    if (cc < 10) return cc;
+    const unsigned char mask = 'a' - 'A';
+    static_assert(mask == 32, "..."); // single digit
+    c |= mask; // unified to 'a'..'f'
+    cc = c - 'a';
+    return (cc < 6) ? (cc + 10) : -1;
 }
 
-std::string& estring::append(uint64_t x)
+bool estring_view::hex_to_uint64_check(uint64_t* v) const {
+    if (this->empty()) return false;
+    uint64_t val = hex_char_to_digit((*this)[0]);
+    if (val == -1ul) return false;
+    for (unsigned char c : this->substr(1)) {
+        auto d = hex_char_to_digit(c);
+        if (d == -1) break;
+        val = val * 16 + d;
+    }
+    if (v) *v = val;
+    return true;
+}
+
+estring& estring::append(uint64_t x)
 {
     auto begin = size();
     do
@@ -94,3 +103,58 @@ std::string& estring::append(uint64_t x)
     std::reverse(ptr + begin, ptr + end);
     return *this;
 }
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>().append(0ULL))>::value,
+    "estring append uint64 should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>().append('0'))>::value,
+    "estring append char should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>().append("Hello"))>::value,
+    "estring append char* should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>().append(std::declval<char*>(), 5))>::value,
+    "estring append char* and size should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>().append(std::declval<std::string>()))>::value,
+    "estring append std::string should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>().append(std::declval<std::string_view>()))>::value,
+    "estring append std::string_view should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>() += 0ULL)>::value,
+    "estring += uint64 should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>() += '0')>::value,
+    "estring += char should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>() += "Hello")>::value,
+    "estring += char* should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>() += std::declval<std::string>())>::value,
+    "estring += std::string should return estring"
+);
+
+static_assert(
+    std::is_same<estring&, decltype(std::declval<estring>() += std::declval<std::string_view>())>::value,
+    "estring += std::string_view should return estring"
+);

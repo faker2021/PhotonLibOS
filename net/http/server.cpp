@@ -18,6 +18,7 @@ limitations under the License.
 #include <string>
 #include <fcntl.h>
 #include <vector>
+#include <sys/stat.h>
 #include <photon/net/socket.h>
 #include <photon/common/alog-stdstring.h>
 #include <photon/common/estring.h>
@@ -171,8 +172,6 @@ public:
 };
 
 
-constexpr static uint64_t KminFileLife = 30 * 1000UL * 1000UL;
-
 class FsHandler : public HTTPHandler {
 public:
     fs::IFileSystem* m_fs;
@@ -215,19 +214,15 @@ public:
         }
         auto file_end_pos = buf.st_size - 1;
         auto range = req.headers.range();
-        if ((range.first < 0) && (range.second < 0)) {
-            range.first = 0;
-            range.second = file_end_pos;
-        }
         if (range.first < 0) {
             range.first = file_end_pos - range.second;
             range.second = file_end_pos;
         }
-        if (range.second < 0) {
+        if (range.second < 0 || range.second > file_end_pos) {
             range.second = file_end_pos;
         }
-        if ((range.second < range.first) || (range.first > file_end_pos)
-                                         || (range.second > file_end_pos)) {
+        if (buf.st_size > 0 &&
+            (range.second < range.first || range.first > file_end_pos)) {
             failed_resp(resp, 416);
             LOG_ERROR_RETURN(0, 0, "invalid request range ", target);
         }

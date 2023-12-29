@@ -1,3 +1,19 @@
+/*
+Copyright 2022 The Photon Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 #include <photon/io/fd-events.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -5,13 +21,14 @@
 #include <sys/event.h>
 #include <photon/common/alog.h>
 #include "events_map.h"
+#include "reset_handle.h"
 
 namespace photon {
 
 constexpr static EventsMap<EVUnderlay<EVFILT_READ, EVFILT_WRITE, EVFILT_EXCEPT>>
     evmap;
 
-class KQueue : public MasterEventEngine, public CascadingEventEngine {
+class KQueue : public MasterEventEngine, public CascadingEventEngine, public ResetHandle {
 public:
     struct InFlightEvent {
         uint32_t interests = 0;
@@ -37,6 +54,15 @@ public:
             LOG_ERRNO_RETURN(0, -1, "failed to setup self-wakeup EVFILT_USER event by kevent()");
         }
         return 0;
+    }
+
+    int reset() override {
+        LOG_INFO("Reset event engine: kqueue");
+        _kq = -1;                   // kqueue fd is not inherited from the parent process
+        _inflight_events.clear();   // reset members
+        _n = 0;
+        _tm = {0, 0};
+        return init();              // re-init
     }
 
     ~KQueue() override {
@@ -93,7 +119,7 @@ public:
             auto th = (thread*) _events[i].udata;
             if (th) thread_interrupt(th, EOK);
         }
-        if (ret == LEN(_events)) {  // there may be more events
+        if (ret == (int) LEN(_events)) {  // there may be more events
             tm.tv_sec = tm.tv_nsec = 0;
             goto again;
         }
@@ -158,7 +184,7 @@ public:
             LOG_ERRNO_RETURN(0, -1, "failed to call kevent()");
 
         _n = 0;
-        assert(ret <= count);
+        assert(ret <= (int) count);
         for (int i = 0; i < ret; ++i) {
             data[i] = _events[i].udata;
         }

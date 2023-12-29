@@ -33,6 +33,7 @@ limitations under the License.
 #include <photon/common/alog.h>
 #include <photon/common/iovector.h>
 #include <photon/common/utility.h>
+#include "base_socket.h"
 
 #ifndef MSG_ZEROCOPY
 #define MSG_ZEROCOPY    0x4000000
@@ -96,30 +97,12 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen,
                 if (ret < 0) return -1;
                 socklen_t n = sizeof(err);
                 ret = getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &n);
-                if (ret < 0) return -1;
+                if (unlikely(ret < 0)) return -1;
                 if (err) {
                     errno = err;
                     return -1;
                 }
                 return 0;
-            }
-        }
-        return ret;
-    }
-}
-template <typename IOCB, typename WAITCB>
-static __FORCE_INLINE__ ssize_t doio(IOCB iocb, WAITCB waitcb) {
-    while (true) {
-        ssize_t ret = iocb();
-        if (ret < 0) {
-            auto e = errno;  // errno is usually a macro that expands to a
-                             // function call
-            if (e == EINTR) continue;
-            if (e == EAGAIN || e == EWOULDBLOCK) {
-                if (waitcb())  // non-zero result means timeout or interrupt,
-                               // need to return
-                    return ret;
-                continue;
             }
         }
         return ret;
@@ -199,9 +182,24 @@ ssize_t zerocopy_n(int fd, iovec* iov, int iovcnt, uint32_t& num_calls, uint64_t
     return doiov_n(v, LAMBDA_TIMEOUT(sendmsg_zerocopy(fd, v.iov, v.iovcnt, num_calls, timeout)));
 }
 
-ssize_t send(int fd, const void *buf, size_t count, int flag, uint64_t timeout) {
-    return doio(LAMBDA(::send(fd, buf, count, flag | MSG_NOSIGNAL)),
+ssize_t send(int fd, const void *buf, size_t count, int flags, uint64_t timeout) {
+    return doio(LAMBDA(::send(fd, buf, count, flags)),
                     LAMBDA_TIMEOUT(photon::wait_for_fd_writable(fd, timeout)));
+}
+
+ssize_t sendmsg(int fd, const struct msghdr* msg, int flags, uint64_t timeout) {
+    return doio(LAMBDA(::sendmsg(fd, msg, flags)),
+                LAMBDA_TIMEOUT(photon::wait_for_fd_writable(fd, timeout)));
+}
+
+ssize_t recv(int fd, void* buf, size_t count, int flags, uint64_t timeout) {
+    return doio(LAMBDA(::recv(fd, buf, count, flags)),
+                LAMBDA_TIMEOUT(photon::wait_for_fd_readable(fd, timeout)));
+}
+
+ssize_t recvmsg(int fd, struct msghdr* msg, int flags, uint64_t timeout) {
+    return doio(LAMBDA(::recvmsg(fd, msg, flags)),
+                LAMBDA_TIMEOUT(photon::wait_for_fd_readable(fd, timeout)));
 }
 
 ssize_t sendv(int fd, const struct iovec *iov, int iovcnt, int flag, uint64_t timeout) {
@@ -221,7 +219,7 @@ ssize_t sendv_n(int fd, struct iovec *iov, int iovcnt, int flag, uint64_t timeou
     return doiov_n(v, LAMBDA_TIMEOUT(sendv(fd, (struct iovec*)v.iov, (int)v.iovcnt, flag, timeout)));
 }
 ssize_t write(int fd, const void *buf, size_t count, uint64_t timeout) {
-    return send(fd, buf, count, 0, timeout);
+    return send(fd, buf, count, MSG_NOSIGNAL, timeout);
 }
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt, uint64_t timeout) {
     return sendv(fd, iov, iovcnt, 0, timeout);
@@ -231,6 +229,25 @@ ssize_t write_n(int fd, const void *buf, size_t count, uint64_t timeout) {
 }
 ssize_t writev_n(int fd, struct iovec *iov, int iovcnt, uint64_t timeout) {
     return sendv_n(fd, iov, iovcnt, 0, timeout);
+}
+
+ssize_t sendfile_fallback(ISocketStream* out_stream,
+            int in_fd, off_t offset, size_t count, uint64_t timeout) {
+    char buf[64 * 1024];
+    void* ptr_unused = nullptr;
+    auto func = [&]() -> ssize_t {
+        size_t s = sizeof(buf);
+        if (s > count) s = count;
+        ssize_t n_read = ::pread(in_fd, buf, s, offset);
+        if (n_read != (ssize_t) s)
+            LOG_ERRNO_RETURN(0, (ssize_t)-1, "failed to read fd ", in_fd);
+        offset += n_read;
+        ssize_t n_write = out_stream->write(buf, s);
+        if (n_write != (ssize_t) s)
+            LOG_ERRNO_RETURN(0, (ssize_t)-1, "failed to write to stream ", out_stream);
+        return n_write;
+    };
+    return doio_n(ptr_unused, count, func);
 }
 
 bool ISocketStream::skip_read(size_t count) {
@@ -245,13 +262,76 @@ bool ISocketStream::skip_read(size_t count) {
     return true;
 }
 
+ssize_t ISocketStream::recv_at_least(void* buf, size_t count, size_t least, int flags) {
+    size_t n = 0;
+    do {
+        ssize_t ret = this->recv(buf, count, flags);
+        if (ret < 0) return ret;
+        if (ret == 0) break;    // EOF
+        if ((n += ret) >= least) break;
+        count -= ret;
+    } while (count);
+    return n;
+}
+
+ssize_t ISocketStream::recv_at_least_mutable(struct iovec *iov, int iovcnt,
+                                             size_t least, int flags /*=0*/) {
+    size_t n = 0;
+    iovector_view v(iov, iovcnt);
+    do {
+        ssize_t ret = this->recv(v.iov, v.iovcnt, flags);
+        if (ret < 0) return ret;
+        if (ret == 0) break;    // EOF
+        if ((n += ret) >= least) break;
+        auto r = v.extract_front(ret);
+        assert(r == ret); (void)r;
+    } while (v.iovcnt && v.iov->iov_len);
+    return n;
+}
+
+int do_get_name(int fd, Getter getter, EndPoint& addr) {
+    sockaddr_storage storage;
+    socklen_t len = storage.get_max_socklen();
+    int ret = getter(fd, storage.get_sockaddr(), &len);
+    if (ret < 0 || len > storage.get_max_socklen()) return -1;
+    addr = storage.to_endpoint();
+    return 0;
+}
+
+int do_get_name(int fd, Getter getter, char* path, size_t count) {
+    struct sockaddr_un addr_un;
+    socklen_t len = sizeof(addr_un);
+    int ret = getter(fd, (struct sockaddr*) &addr_un, &len);
+    // if len larger than size of addr_un, or less than prefix in addr_un
+    if (ret < 0 || len > sizeof(addr_un) || len <= sizeof(addr_un.sun_family))
+        return -1;
+    strncpy(path, addr_un.sun_path, count);
+    return 0;
+}
+
+int fill_uds_path(struct sockaddr_un& name, const char* path, size_t count) {
+    const int LEN = sizeof(name.sun_path) - 1;
+    if (count == 0) count = strlen(path);
+    if (count > LEN)
+        LOG_ERROR_RETURN(ENAMETOOLONG, -1, "pathname is too long (`>`)", count,
+                         LEN);
+
+    memset(&name, 0, sizeof(name));
+    memcpy(name.sun_path, path, count + 1);
+#ifndef __linux__
+    name.sun_len = 0;
+#endif
+    name.sun_family = AF_UNIX;
+    return 0;
+}
+
 #ifdef __linux__
 static ssize_t recv_errqueue(int fd, uint32_t &ret_counter) {
     char control[128];
     msghdr msg = {};
     msg.msg_control = control;
     msg.msg_controllen = sizeof(control);
-    auto ret = recvmsg(fd, &msg, MSG_ERRQUEUE);
+    auto ret = ::recvmsg(fd, &msg, MSG_ERRQUEUE);
     if (ret < 0) return ret;
     cmsghdr* cm = CMSG_FIRSTHDR(&msg);
     if (cm == nullptr) {
@@ -295,6 +375,7 @@ ssize_t zerocopy_confirm(int fd, uint32_t num_calls, uint64_t timeout) {
     } while (is_counter_less_than(counter, num_calls));
     return 0;
 }
-#endif
+#endif // __linux__
+
 }  // namespace net
-}
+}  // namespace photon

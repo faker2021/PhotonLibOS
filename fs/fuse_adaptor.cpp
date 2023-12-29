@@ -80,13 +80,21 @@ namespace photon {
 namespace fs{
 
 static IFileSystem* fs = nullptr;
+static uid_t cuid = 0, cgid = 0;
 
 #define CHECK_FS() if (!fs) return -EFAULT;
 
 static void* xmp_init(struct fuse_conn_info *conn)
 {
     REPORT_PERF(xmp_init, 1)
-    (void) conn;
+    cuid  = geteuid();
+    cgid  = getegid();
+    if ((unsigned int)conn->capable & FUSE_CAP_ATOMIC_O_TRUNC) {
+        conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
+    }
+    if ((unsigned int)conn->capable & FUSE_CAP_BIG_WRITES) {
+        conn->want |= FUSE_CAP_BIG_WRITES;
+    }
     return NULL;
 }
 
@@ -102,9 +110,13 @@ static int xmp_getattr(const char *path, struct stat *stbuf)
     CHECK_FS();
     errno = 0;
     int res = fs->lstat(path, stbuf);
-    if(res) \
-        LOG_ERROR_RETURN(0, errno ? -errno : res, VALUE(path));
-    errno = 0;
+    if(res) return -errno;
+    stbuf->st_blocks = stbuf->st_size / 512 + 1;  // du relies on this
+    stbuf->st_blksize = 4096;
+    // use current user/group when backendfs doesn't support uid/gid
+    if (stbuf->st_uid == 0) stbuf->st_uid = cuid;
+    if (stbuf->st_gid == 0) stbuf->st_gid = cgid;
+    if (stbuf->st_nlink == 0) stbuf->st_nlink = 1;
     return 0;
 }
 
@@ -661,13 +673,9 @@ int fuser_go(IFileSystem* fs_, int argc, char* argv[])
 
 int fuser_go_exportfs(IFileSystem *fs_, int argc, char *argv[]) {
     if (!fs_) return 0;
-    photon::vcpu_init();
-    DEFER(photon::vcpu_fini());
-    photon::fd_events_init();
-    DEFER(photon::fd_events_fini());
-
-    exportfs_init();
-    DEFER(exportfs_fini());
+    if (photon::init(INIT_EVENT_DEFAULT, INIT_IO_DEFAULT | INIT_IO_EXPORTFS))
+        return -1;
+    DEFER(photon::fini());
 
     auto efs = export_as_sync_fs(fs_);
 

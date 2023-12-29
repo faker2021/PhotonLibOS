@@ -41,7 +41,7 @@ Message::~Message() {
         delete m_stream;
     }
 
-    if (m_buf_ownership && m_buf)
+    if (m_buf_ownership)
         free(m_buf);
 }
 
@@ -57,7 +57,8 @@ int Message::receive_header(uint64_t timeout) {
         }
         if (ret == 1)
             return 1;
-        break;
+        if (ret != 2)
+            break;
     }
     return prepare_body_read_stream();
 }
@@ -68,11 +69,15 @@ int Message::receive_bytes(net::ISocketStream* stream) {
         LOG_ERROR_RETURN(ENOBUFS, -1, "no buffer");
 
     auto rc = stream->recv(m_buf + m_buf_size, MAX_TRANSFER_BYTES);
-    if (message_status == INIT && rc == 0)
+    if (rc < 0) {
+        LOG_ERRNO_RETURN(0, rc, "failed to receive data ", VALUE(rc));
+    }
+    if (message_status == INIT && rc == 0) {
         return 1;
-    auto ret = (rc < 0) ? rc : append_bytes((uint16_t)rc);
+    }
+    auto ret = append_bytes((uint16_t)rc);
     if (ret != 0 && rc == 0)
-        LOG_ERROR_RETURN(0, -1, "Peer closed");
+        LOG_ERROR_RETURN(0, -1, "Peer closed"); // unexpected end of stream
     return ret;
 }
 
@@ -88,7 +93,7 @@ int Message::append_bytes(uint16_t size) {
     m_buf_size += size;
     std::string_view whole(left, m_buf + m_buf_size - left);
     auto pos = whole.find("\r\n\r\n");
-    if (pos == whole.npos) return 1;
+    if (pos == whole.npos) return 2;
 
     pos += 4 - (income - left);
     auto body_begin = sv.begin() + pos - m_buf;
@@ -100,11 +105,14 @@ int Message::append_bytes(uint16_t size) {
         return parse_res;
     }
 
-    LOG_DEBUG("add headers, header buf size `", m_buf + m_buf_capacity - p.cur());
-    if (headers.reset(p.cur(), m_buf + m_buf_capacity - p.cur(), m_buf + m_buf_size - p.cur()) < 0)
+    auto buf_cap = m_buf + m_buf_capacity - p.cur();
+    auto buf_size = m_buf + m_buf_size - p.cur();
+    LOG_DEBUG("add headers: ", VALUE(buf_cap), VALUE(buf_size));
+    if (headers.reset(p.cur(), buf_cap, buf_size) < 0)
         LOG_ERRNO_RETURN(0, -1, "failed to parse headers");
 
-    m_abandon = (headers.get_value("Connection") == "close") || (!headers.get_value("Trailer").empty());
+    m_abandon = (headers["Connection"] == "close" ||
+                !headers["Trailer"].empty());
     message_status = HEADER_PARSED;
     LOG_DEBUG("header parsed");
     return 0;
@@ -113,11 +121,9 @@ int Message::append_bytes(uint16_t size) {
 int Message::send_header(net::ISocketStream* stream) {
     if (stream != nullptr) m_stream = stream; // update stream if needed
 
-    if (m_keep_alive)
-        headers.insert("Connection", "keep-alive");
-    else
-        headers.insert("Connection", "close");
-
+    using SV = std::string_view;
+    headers.insert("Connection", m_keep_alive ? SV("keep-alive") :
+                                                SV("close"));
     if (headers.space_remain() < 2)
         LOG_ERRNO_RETURN(ENOBUFS, -1, "no buffer");
 
@@ -241,7 +247,7 @@ ssize_t Message::resource_size() const {
     return estring_view(ret).to_uint64();
 }
 
-uint64_t Message::body_size() const {
+size_t Message::body_size() const {
     if (m_verb == Verb::HEAD) return 0;
     auto it = headers.find("Content-Length");
     if (it != headers.end()) return estring_view(it.second()).to_uint64();
@@ -304,7 +310,7 @@ int Request::reset(Verb v, std::string_view url, bool enable_proxy) {
     if ((size_t)m_buf_capacity <= u.target().size() + 21 + verbstr[v].size())
         LOG_ERROR_RETURN(ENOBUFS, -1, "out of buffer");
 
-    LOG_DEBUG("requst reset ", VALUE(u.host()), VALUE(u.host_port()));
+    LOG_DEBUG("requst reset ", VALUE(u.host()), VALUE(enable_proxy));
 
     Message::reset();
     make_request_line(v, u, enable_proxy);
@@ -317,19 +323,17 @@ int Request::reset(Verb v, std::string_view url, bool enable_proxy) {
 
 int Request::redirect(Verb v, estring_view location, bool enable_proxy) {
     estring full_location;
-    if (!location.starts_with(http_url_scheme) && (!location.starts_with(https_url_scheme))) {
+    if (!location.starts_with(http_url_scheme) &&
+        !location.starts_with(https_url_scheme)) {
         full_location.appends(secure() ? https_url_scheme : http_url_scheme,
                              host(), location);
         location = full_location;
     }
     StoredURL u(location);
-    auto new_request_line_size = verbstr[v].size() + sizeof(" HTTP/1.1\r\n");
-    if (enable_proxy)
-        new_request_line_size += full_url_size(u);
-    else
-        new_request_line_size += u.target().size();
+    auto new_request_line_size = verbstr[v].size() + sizeof(" HTTP/1.1\r\n") +
+        (enable_proxy ? full_url_size(u) : u.target().size());
 
-    auto delta = new_request_line_size - m_buf_size;
+    int delta = (int)new_request_line_size - m_buf_size;
     LOG_DEBUG(VALUE(delta));
     if (headers.reset_host(delta, u.host_port()) < 0)
         LOG_ERROR_RETURN(0, -1, "failed to move header data");
@@ -364,7 +368,7 @@ int Response::parse_status_line(Parser &p) {
     p.skip_chars(' ');
     auto code = p.extract_integer();
     if (code <= 0 || code >= 1000)
-        LOG_ERROR_RETURN(0, -1, "invalid status code");
+        LOG_ERROR_RETURN(0, -1, "invalid status code ", code);
     m_status_code = (uint16_t)code;
     p.skip_chars(' ');
     m_status_message = p.extract_until_char('\r');
@@ -376,11 +380,9 @@ int Response::set_result(int code, std::string_view reason) {
     char* buf = m_buf;
     m_status_code = code;
     buf_append(buf, "HTTP/1.1 ");
-    buf_append(buf, std::to_string(code));
+    buf_append(buf, code);
     buf_append(buf, " ");
-    auto message = reason;
-    if (message.empty()) message = obsolete_reason(code);
-    buf_append(buf, message);
+    buf_append(buf, reason.size() ? reason : obsolete_reason(code));
     buf_append(buf, "\r\n");
     m_buf_size = buf - m_buf;
     headers.reset(m_buf + m_buf_size, m_buf_capacity - m_buf_size);

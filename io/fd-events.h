@@ -16,6 +16,7 @@ limitations under the License.
 
 #pragma once
 #include <sys/types.h>
+#include <photon/photon.h>
 #include <photon/thread/thread.h>
 
 namespace photon {
@@ -110,6 +111,7 @@ public:
 
     /**
      * @brief Wait for events, returns number of the arrived events, and their associated `data`
+     * @note This call will not return until timeout, if there had been no events.
      * @param[out] data
      * @return -1 for error, positive integer for the number of events, 0 for no events and should run it again
      * @warning Do NOT block vcpu
@@ -119,37 +121,49 @@ public:
 
 template<typename Ctor> inline
 int _fd_events_init(Ctor new_engine) {
-    assert(is_master_event_engine_default());
-    auto ee = get_vcpu()->master_event_engine = new_engine();
-    return -!ee;
+    auto ee = new_engine();
+    if (!ee)
+        return -1;
+    get_vcpu()->master_event_engine = ee;
+    return 0;
+}
+
+#define DECLARE_MASTER_AND_CASCADING_ENGINE(name)           \
+MasterEventEngine* new_##name##_master_engine();            \
+CascadingEventEngine* new_##name##_cascading_engine();      \
+
+DECLARE_MASTER_AND_CASCADING_ENGINE(epoll);
+DECLARE_MASTER_AND_CASCADING_ENGINE(select);
+DECLARE_MASTER_AND_CASCADING_ENGINE(iouring);
+DECLARE_MASTER_AND_CASCADING_ENGINE(kqueue);
+DECLARE_MASTER_AND_CASCADING_ENGINE(epoll_ng);
+
+inline int fd_events_init(int master_engine) {
+    switch (master_engine) {
+#ifdef __linux__
+        case INIT_EVENT_EPOLL:
+            return _fd_events_init(&new_epoll_master_engine);
+        case INIT_EVENT_EPOLL_NG:
+            return _fd_events_init(&new_epoll_ng_master_engine);
+#endif
+        case INIT_EVENT_SELECT:
+            return _fd_events_init(&new_select_master_engine);
+#ifdef PHOTON_URING
+        case INIT_EVENT_IOURING:
+            return _fd_events_init(&new_iouring_master_engine);
+#endif
+#ifdef __APPLE__
+        case INIT_EVENT_KQUEUE:
+            return _fd_events_init(&new_kqueue_master_engine);
+#endif
+        default:
+            return -1;
+    }
 }
 
 inline int fd_events_fini() {
     reset_master_event_engine_default();
     return 0;
-}
-
-#define DEFINE_ENGINE_INIT_FINI(name)                       \
-MasterEventEngine* new_##name##_master_engine();            \
-CascadingEventEngine* new_##name##_cascading_engine();      \
-inline int fd_events_##name##_init() {                      \
-    return _fd_events_init( &new_##name##_master_engine );  \
-}                                                           \
-inline int fd_events_##name##_fini() {                      \
-    return fd_events_fini();                                \
-}
-
-DEFINE_ENGINE_INIT_FINI(epoll);
-DEFINE_ENGINE_INIT_FINI(select);
-DEFINE_ENGINE_INIT_FINI(iouring);
-DEFINE_ENGINE_INIT_FINI(kqueue);
-
-inline int fd_events_init() {
-#ifdef __APPLE__
-    return fd_events_kqueue_init();
-#else
-    return fd_events_epoll_init();
-#endif
 }
 
 inline CascadingEventEngine* new_default_cascading_engine() {
@@ -160,9 +174,10 @@ inline CascadingEventEngine* new_default_cascading_engine() {
 #endif
 }
 
+#undef DECLARE_MASTER_AND_CASCADING_ENGINE
 
-#undef DEFINE_ENGINE_INIT_FINI
+// TODO: implement select engine in separate cpp files
+inline MasterEventEngine* new_select_master_engine() { return nullptr; }
+inline CascadingEventEngine* new_select_cascading_engine() { return nullptr; }
 
 } // namespace photon
-
-

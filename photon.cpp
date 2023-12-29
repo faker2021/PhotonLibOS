@@ -16,10 +16,13 @@ limitations under the License.
 
 #include "photon.h"
 
-#include "thread/thread.h"
 #include "io/fd-events.h"
 #include "io/signal.h"
 #include "io/aio-wrapper.h"
+#ifdef ENABLE_FSTACK_DPDK
+#include "io/fstack-dpdk.h"
+#endif
+#include "io/reset_handle.h"
 #include "net/curl.h"
 #include "net/socket.h"
 #include "fs/exportfs.h"
@@ -28,55 +31,74 @@ namespace photon {
 
 using namespace fs;
 using namespace net;
-inline int fd_events_signal_init() { return sync_signal_init(); }
-inline int fd_events_signal_fini() { return sync_signal_fini(); }
+
+static bool reset_handle_registed = false;
 static thread_local uint64_t g_event_engine = 0, g_io_engine = 0;
 
-#define INIT(cond, x)       if (cond) { if (x##_init() < 0) return -1; }
-#define INIT_EVENT(flag, x) INIT(INIT_EVENT_##flag & event_engine, fd_events_##x)
-#define INIT_IO(flag, x)    INIT(INIT_IO_##flag & io_engine, x)
-int init(uint64_t event_engine, uint64_t io_engine) {
-    INIT(1, vcpu);
+#define INIT_IO(name, prefix)    if (INIT_IO_##name & io_engine) { if (prefix##_init() < 0) return -1; }
+#define FINI_IO(name, prefix)    if (INIT_IO_##name & g_io_engine) { prefix##_fini(); }
+
+// Try to init master engine with the recommended order
 #if defined(__linux__)
-    INIT_EVENT(EPOLL, epoll)
-#ifdef PHOTON_URING
-    else INIT_EVENT(IOURING, iouring)
-#endif  // PHOTON_URING
-#elif defined(__APPLE__)
-    INIT_EVENT(KQUEUE, kqueue)
+static const int recommended_order[] = {INIT_EVENT_EPOLL, INIT_EVENT_IOURING, INIT_EVENT_EPOLL_NG, INIT_EVENT_SELECT};
+#else   // macOS, FreeBSD ...
+static const int recommended_order[] = {INIT_EVENT_KQUEUE, INIT_EVENT_SELECT};
 #endif
-    INIT_EVENT(SIGNAL, signal)
+
+int init(uint64_t event_engine, uint64_t io_engine) {
+    if (vcpu_init() < 0)
+        return -1;
+
+    if (event_engine != INIT_EVENT_NONE) {
+        bool ok = false;
+        for (auto each : recommended_order) {
+            if ((each & event_engine) && fd_events_init(each) == 0) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            LOG_ERROR_RETURN(0, -1, "All master engines init failed");
+        }
+    }
+
+    if ((INIT_EVENT_SIGNAL & event_engine) && sync_signal_init() < 0)
+        return -1;
+
+#ifdef ENABLE_FSTACK_DPDK
+    INIT_IO(FSTACK_DPDK, fstack_dpdk);
+#endif
+    INIT_IO(EXPORTFS, exportfs)
     INIT_IO(LIBCURL, libcurl)
 #ifdef __linux__
     INIT_IO(LIBAIO, libaio_wrapper)
     INIT_IO(SOCKET_EDGE_TRIGGER, et_poller)
 #endif
-    INIT_IO(EXPORTFS, exportfs)
     g_event_engine = event_engine;
     g_io_engine = io_engine;
+    if (!reset_handle_registed) {
+        pthread_atfork(nullptr, nullptr, &reset_all_handle);
+        LOG_DEBUG("reset_all_handle registed ", VALUE(getpid()));
+        reset_handle_registed = true;
+    }
     return 0;
 }
 
-#define FINI(cond, x)       if (cond) { x##_fini(); }
-#define FINI_EVENT(flag, x) FINI(INIT_EVENT_##flag & g_event_engine, fd_events_##x)
-#define FINI_IO(flag, x)    FINI(INIT_IO_##flag & g_io_engine, x)
 int fini() {
-    FINI_EVENT(SIGNAL, signal)
 #ifdef __linux__
     FINI_IO(LIBAIO, libaio_wrapper)
     FINI_IO(SOCKET_EDGE_TRIGGER, et_poller)
 #endif
     FINI_IO(LIBCURL, libcurl)
     FINI_IO(EXPORTFS, exportfs)
-#if defined(__linux__)
-    FINI_EVENT(EPOLL, epoll)
-#ifdef PHOTON_URING
-    else FINI_EVENT(IOURING, iouring)
-#endif // PHOTON_URING
-#elif defined(__APPLE__)
-    FINI_EVENT(KQUEUE, kqueue)
+#ifdef ENABLE_FSTACK_DPDK
+    FINI_IO(FSTACK_DPDK, fstack_dpdk)
 #endif
-    FINI(1, vcpu);
+
+    if (INIT_EVENT_SIGNAL & g_event_engine)
+        sync_signal_fini();
+    fd_events_fini();
+    vcpu_fini();
     g_event_engine = g_io_engine = 0;
     return 0;
 }

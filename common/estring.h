@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdio>
 #include <cassert>
 #include <cstring>
+#include <math.h>
 #include <limits>
 #include <string>
 #include <bitset>
@@ -289,11 +290,41 @@ public:
     uint64_t to_uint64(uint64_t default_val = 0) const
     {
         uint64_t val;
-        to_uint64_check(&val);
-        return val;
+        return to_uint64_check(&val) ? val : default_val;
     }
-    // do not support 0x/0X prefix
-    uint64_t hex_to_uint64() const;
+    bool     to_int64_check(int64_t* v = nullptr) const
+    {
+        if (this->empty()) return false;
+        if (this->front() != '-') return to_uint64_check((uint64_t*)v);
+        bool ret = this->substr(1).to_uint64_check((uint64_t*)v);
+        if (ret) *v = -*v;
+        return ret;
+    }
+    int64_t to_int64(int64_t default_val = 0) const
+    {
+        int64_t val;
+        return to_int64_check(&val) ? val : default_val;
+    }
+    bool to_double_check(double* v = nullptr)
+    {
+        char buf[32];
+        auto len = std::max(this->size(), sizeof(buf) - 1 );
+        memcpy(buf, data(), len);
+        buf[len] = '0';
+        return sscanf(buf, "%lf", v) == 1;
+    }
+    double to_double(double default_val = NAN)
+    {
+        double val;
+        return to_double_check(&val) ? val : default_val;
+    }
+    // not including 0x/0X prefix
+    bool hex_to_uint64_check(uint64_t* v = nullptr) const;
+    uint64_t hex_to_uint64(uint64_t default_val = 0) const
+    {
+        uint64_t val;
+        return hex_to_uint64_check(&val) ? val : default_val;
+    }
 };
 
 inline bool operator == (const std::string_view& sv, const std::string& s)
@@ -312,8 +343,8 @@ class rstring_view  // relative string_view, that stores values relative
 protected:
     static_assert(std::is_integral<OffsetType>::value, "...");
     static_assert(std::is_integral<LengthType>::value, "...");
-    OffsetType _offset;
-    LengthType _length;
+    OffsetType _offset = 0;
+    LengthType _length = 0;
 
     estring_view to_abs(const char* s) const
     {
@@ -321,12 +352,8 @@ protected:
     }
 
 public:
-    constexpr rstring_view() = default; // note: don't give _offset or _length
-                                        // an initial value and do not
-                                        // assigned them in default ctor()
-                                        // it would caused verb_init() error
-    rstring_view(uint64_t offset, uint64_t length)
-    {
+    constexpr rstring_view() = default;
+    constexpr rstring_view(uint64_t offset, uint64_t length) {
         assert(offset <= std::numeric_limits<OffsetType>::max());
         assert(length <= std::numeric_limits<LengthType>::max());
         _offset = (OffsetType)offset;
@@ -445,24 +472,33 @@ public:
             n);
     }
 
-    using std::string::operator+=;
-    std::string& operator += (const std::string_view &rhs)
+    // using std::string::operator+=;
+    template<typename T>
+    estring& operator+=(T&& t) {
+        return (estring&)std::string::operator+=(std::forward<T>(t));
+    }
+    estring& operator += (const std::string_view &rhs)
     {
         return append(rhs);
     }
-    using std::string::append;
-    std::string& append(uint64_t x);
-    std::string& append(const std::string_view& sv)
+    // using std::string::append;
+    template <typename... Args>
+    estring& append(Args&&... t) {
+        return (estring&)std::string::append(std::forward<Args>(t)...);
+    }
+    estring& append(uint64_t x);
+    estring& append(const std::string_view& sv)
     {
         return append(sv.data(), sv.size());
     }
 
     template<typename...Ts>
-    std::string& appends(const Ts&...xs)
+    estring& appends(const Ts&...xs)
     {
-        return append(make_cat_list(xs...));
+        return cat(make_cat_list(xs...));
     }
 
+protected:
     template<typename...Ts>
     class CatList : public std::tuple<Ts...>
     {
@@ -495,7 +531,7 @@ public:
 
     template<typename...Ts>
     __attribute__((always_inline))
-    std::string& append(const CatList<Ts...>& cl)
+    estring& cat(const CatList<Ts...>& cl)
     {
         UpperBoundEstimator estimator;
         this->enumerate(cl, estimator);
@@ -506,18 +542,17 @@ public:
     }
 
     template<typename...Ts>
-    std::string& append(const ConditionalCatList<Ts...>& ccl)
+    estring& cat(const ConditionalCatList<Ts...>& ccl)
     {
-        return ccl._cond ? append(ccl._cl) : *this;
+        return ccl._cond ? cat(ccl._cl) : *this;
     }
 
     template<typename A, typename B>
-    std::string& append(const ConditionalCatList2<A, B>& x)
+    estring& cat(const ConditionalCatList2<A, B>& x)
     {
-        return x._cond ? append(x._cl1) : append(x._cl2);
+        return x._cond ? cat(x._cl1) : cat(x._cl2);
     }
 
-protected:
     template<typename...Ts>
     static const ConditionalCatList<Ts...>&
                                  cat_item_filter(const ConditionalCatList<Ts...>& x)
@@ -542,12 +577,12 @@ public:
         return {cond, cat_item_filter(xs)...};
     }
 
-    // template<typename A, typename B> static
-    // auto make_conditional_cat_list2(bool cond, const A& a, const B& b) ->
-    //     ConditionalCatList2<A, B>
-    // {
-    //     return {cond, a, b};
-    // }
+    template<typename ...As, typename ...Bs> static
+    auto make_conditional_cat_list2(bool cond, const CatList<As...>& a, const CatList<Bs...>& b) ->
+        ConditionalCatList2<CatList<As...>, CatList<Bs...>>
+    {
+        return {cond, a, b};
+    }
 
 protected:
     template<size_t I = 0, typename...Ts, typename Mapper>

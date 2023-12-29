@@ -109,7 +109,7 @@ TEST(http_server, post) {
     DEFER(delete op);
     op->req.headers.content_length(10);
     std::string body = "1234567890";
-    auto writer = [&](Request *req)-> int {
+    auto writer = [&](Request *req)-> ssize_t {
         return req->write(body.data(), body.size());
     };
     op->body_writer = writer;
@@ -343,7 +343,7 @@ TEST(http_server, proxy_handler_post) {
     DEFER(delete op);
     std::string body = "1234567890";
     op->req.headers.content_length(10);
-    auto writer = [&](Request *req)-> int {
+    auto writer = [&](Request *req)-> ssize_t {
         return req->write(body.data(), body.size());
     };
     op->body_writer = writer;
@@ -405,7 +405,7 @@ TEST(http_server, proxy_handler_post_forward) {
     DEFER(delete op);
     std::string body = "1234567890";
     op->req.headers.content_length(10);
-    auto writer = [&](Request *req)-> int {
+    auto writer = [&](Request *req)-> ssize_t {
         return req->write(body.data(), body.size());
     };
     op->body_writer = writer;
@@ -521,10 +521,9 @@ TEST(http_server, mux_handler) {
 }
 
 int main(int argc, char** arg) {
-    photon::vcpu_init();
-    DEFER(photon::vcpu_fini());
-    photon::fd_events_init();
-    DEFER(photon::fd_events_fini());
+    if (photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_NONE))
+        return -1;
+    DEFER(photon::fini());
 #ifdef __linux__
     if (net::et_poller_init() < 0) {
         LOG_ERROR("net::et_poller_init failed");
